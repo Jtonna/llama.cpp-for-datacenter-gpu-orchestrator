@@ -1,5 +1,9 @@
 #include "llama-model.h"
 
+#include <atomic>
+#include <exception>
+#include <thread>
+
 #include "llama-arch.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
@@ -2123,9 +2127,38 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         });
     }
 
-    // load tensor data
-    for (auto & [ctx, bufs] : ctx_bufs) {
-        if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+    // load tensor data — if more than one (ctx, bufs) pair exists, run each in its
+    // own thread so independent RPC endpoints fill their dispatcher queues concurrently
+    // instead of serialising on a single loader thread. The mutexes inside
+    // llama_model_loader guard shared state (size_done, progress callback,
+    // mmap_async_by_buf, mmaps_used, lmlocks->grow_to, final-cleanup gate).
+    {
+        std::vector<std::thread> workers;
+        std::vector<std::exception_ptr> worker_errors(ctx_bufs.size());
+        std::atomic<bool> worker_failed{false};
+        workers.reserve(ctx_bufs.size());
+        for (size_t i = 0; i < ctx_bufs.size(); ++i) {
+            auto & [ctx, bufs] = ctx_bufs[i];
+            workers.emplace_back([&, i, ctx]() mutable {
+                try {
+                    if (!ml.load_all_data(ctx, ctx_bufs[i].second,
+                            use_mlock ? &pimpl->mlock_mmaps : NULL,
+                            params.progress_callback,
+                            params.progress_callback_user_data)) {
+                        worker_failed.store(true, std::memory_order_relaxed);
+                    }
+                } catch (...) {
+                    worker_errors[i] = std::current_exception();
+                    worker_failed.store(true, std::memory_order_relaxed);
+                }
+            });
+        }
+        for (auto & t : workers) t.join();
+        ml.finalize_async_uploads();
+        for (auto & e : worker_errors) {
+            if (e) std::rethrow_exception(e);
+        }
+        if (worker_failed.load(std::memory_order_relaxed)) {
             return false;
         }
     }

@@ -8,11 +8,14 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <future>
 #include <regex>
+#include <thread>
+#include <unordered_map>
 #include <unordered_set>
 
 static const size_t kiB = 1024;
@@ -1675,6 +1678,57 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    // Per-buffer async set_tensor backends for the mmap path. Populated lazily and
+    // shared across successive load_all_data calls on this loader so a multi-endpoint
+    // split (one ctx per PS5/RPC server) pipelines the uploads onto independent
+    // dispatcher threads instead of serialising on the loader thread. Drained by
+    // llama_model_loader::finalize_async_uploads(). This setup runs under load_mutex
+    // because sibling load_all_data calls may be executing on other threads.
+    const auto call_t0 = std::chrono::steady_clock::now();
+    const auto thread_id = std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xffff;
+    if (use_mmap && !check_tensors) {
+        std::lock_guard<std::mutex> lk(load_mutex);
+        for (ggml_backend_buffer_t buf : bufs) {
+            if (!buf || mmap_async_by_buf.count(buf)) {
+                continue;
+            }
+            if (ggml_backend_buffer_is_host(buf)) {
+                continue;
+            }
+            auto * buft = ggml_backend_buffer_get_type(buf);
+            auto * dev  = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+            if (!dev) {
+                continue;
+            }
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            if (!props.caps.async || !props.caps.events) {
+                continue;
+            }
+            ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+            if (!be) {
+                continue;
+            }
+            mmap_async_by_buf[buf] = { be, true };
+            LLAMA_LOG_INFO("%s: async RPC upload enabled for buffer type %s on device %s (tid=%04zx)\n",
+                __func__, ggml_backend_buft_name(buft), ggml_backend_dev_name(dev), thread_id);
+
+            // Resolve the hash-probe skip hook once from any RPC backend reg.
+            if (!rpc_set_skip_hash_probe) {
+                auto * reg = ggml_backend_dev_backend_reg(dev);
+                if (reg) {
+                    using fn_t = void (*)(bool);
+                    auto fn = (fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_set_skip_hash_probe");
+                    if (fn) {
+                        rpc_set_skip_hash_probe = fn;
+                        rpc_set_skip_hash_probe(true);
+                        LLAMA_LOG_INFO("%s: RPC SET_TENSOR_HASH probe suppressed for this load\n", __func__);
+                    }
+                }
+            }
+        }
+    }
+
     std::vector<ggml_tensor *> tensors;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         tensors.push_back(cur);
@@ -1702,8 +1756,13 @@ bool llama_model_loader::load_all_data(
             continue;
         }
 
+        if (load_cancelled.load(std::memory_order_relaxed)) {
+            return false;
+        }
         if (progress_callback) {
+            std::lock_guard<std::mutex> lk(load_mutex);
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+                load_cancelled.store(true, std::memory_order_relaxed);
                 return false;
             }
         }
@@ -1736,6 +1795,8 @@ bool llama_model_loader::load_all_data(
             if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
 
+                // These three updates share state with sibling threads when load_all_data runs in parallel.
+                std::lock_guard<std::mutex> lk(load_mutex);
                 // locking a lazy tensor would fault all of it in, which is what lazy avoids
                 if (lmlocks && !lazy.has(cur)) {
                     const auto & lmlock = lmlocks->at(weight->idx);
@@ -1746,7 +1807,14 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
-                ggml_backend_tensor_set(cur, data, 0, n_size);
+                // mmap pointers are stable for the lifetime of the mapping, so fire-and-forget
+                // via the tensor's own buffer backend when it supports async set_tensor.
+                auto it = mmap_async_by_buf.find(cur->buffer);
+                if (it != mmap_async_by_buf.end() && it->second.backend) {
+                    ggml_backend_tensor_set_async(it->second.backend, cur, data, 0, n_size);
+                } else {
+                    ggml_backend_tensor_set(cur, data, 0, n_size);
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
@@ -1840,8 +1908,16 @@ bool llama_model_loader::load_all_data(
             }
         }
 
-        size_done += n_size;
+        {
+            std::lock_guard<std::mutex> lk(load_mutex);
+            size_done += n_size;
+        }
     }
+
+    // mmap_async_by_buf is NOT drained here: a sibling load_all_data call may still be
+    // in flight on another endpoint, and we want this upload to overlap with it. The
+    // owning llama_model_loader drains + frees in finalize_async_uploads() after the
+    // outer loop over ctx_bufs.
 
     // free temporary resources used for async uploads
     for (auto * event : events) {
@@ -1866,8 +1942,24 @@ bool llama_model_loader::load_all_data(
         throw std::runtime_error("found tensors with invalid data");
     }
 
-    // check if this is the last call and do final cleanup
-    if (size_done >= size_data) {
+    // check if this is the last call and do final cleanup. In the threaded case,
+    // only one thread may run the fragment unmap / final progress callback — guard
+    // the whole block with load_mutex and gate on "this thread saw size_done hit size_data
+    // for the first time". `size_done` is only mutated under load_mutex above, so a
+    // same-locked read here is race-free.
+    bool do_final_cleanup = false;
+    {
+        std::lock_guard<std::mutex> lk(load_mutex);
+        if (size_done >= size_data && !final_cleanup_done) {
+            final_cleanup_done = true;
+            do_final_cleanup = true;
+        }
+    }
+    LLAMA_LOG_INFO("%s: context load completed in %.2f s (tid=%04zx)\n",
+        __func__,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - call_t0).count(),
+        thread_id);
+    if (do_final_cleanup) {
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
@@ -1887,6 +1979,31 @@ bool llama_model_loader::load_all_data(
     }
 
     return true;
+}
+
+void llama_model_loader::finalize_async_uploads() {
+    if (mmap_async_by_buf.empty() && !rpc_set_skip_hash_probe) {
+        return;
+    }
+    LLAMA_LOG_INFO("%s: draining %zu async RPC upload backend(s)\n", __func__, mmap_async_by_buf.size());
+    const auto t0 = std::chrono::steady_clock::now();
+    for (auto & kv : mmap_async_by_buf) {
+        if (kv.second.backend) {
+            ggml_backend_synchronize(kv.second.backend);
+        }
+    }
+    const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - t0;
+    LLAMA_LOG_INFO("%s: async RPC upload drain took %.2f s\n", __func__, elapsed.count());
+    if (rpc_set_skip_hash_probe) {
+        rpc_set_skip_hash_probe(false);
+        rpc_set_skip_hash_probe = nullptr;
+    }
+    for (auto & kv : mmap_async_by_buf) {
+        if (kv.second.owned && kv.second.backend) {
+            ggml_backend_free(kv.second.backend);
+        }
+    }
+    mmap_async_by_buf.clear();
 }
 
 std::string llama_model_loader::ftype_name() const {

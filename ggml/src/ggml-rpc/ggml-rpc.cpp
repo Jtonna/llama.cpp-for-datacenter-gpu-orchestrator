@@ -539,8 +539,18 @@ private:
     socket_ptr       sock;
     std::atomic_uint busy_spin_users = 0;
     std::atomic_bool running;
+    std::atomic_bool faulted{false};
     std::thread      thread;
 };
+
+// Global toggle: when true, set_tensor paths skip the synchronous SET_TENSOR_HASH probe
+// and send the data with cache_flag=1 (server still saves the cache entry). Used by the
+// model loader on cold multi-endpoint loads where the probe is pure latency.
+static std::atomic<bool> g_rpc_skip_hash_probe{false};
+
+static void ggml_backend_rpc_set_skip_hash_probe(bool value) {
+    g_rpc_skip_hash_probe.store(value, std::memory_order_relaxed);
+}
 
 static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
 {
@@ -626,7 +636,12 @@ void rpc_dispatcher::synchronize() {
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = RPC_CMD_NONE;
     GGML_ASSERT(queue.push(msg));
-    msg->completion.get_future().wait();
+    auto fut = msg->completion.get_future();
+    while (fut.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
+        if (faulted.load(std::memory_order_relaxed)) {
+            GGML_ABORT("RPC dispatcher faulted: remote crashed or socket error during upload");
+        }
+    }
 }
 
 void rpc_dispatcher::busy_spin_acquire() {
@@ -680,12 +695,19 @@ void rpc_dispatcher::work() {
                      rpc_log_format_size(msg_ptr->input_size).c_str(), rpc_log_format_size(msg_ptr->output_size).c_str());
             const bool trace = rpc_log_debug_level() >= 3;
             const auto t0 = std::chrono::steady_clock::now();
+            bool status;
             if (msg_ptr->output) {
-                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
-                RPC_STATUS_ASSERT(status);
+                status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
             } else {
-                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
-                RPC_STATUS_ASSERT(status);
+                status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
+            }
+            if (!status) {
+                // remote crashed or socket died: flag the dispatcher faulted, complete this
+                // message, and exit the loop so synchronize() can see the fault instead of hanging
+                faulted.store(true, std::memory_order_relaxed);
+                msg_ptr->completion.set_value();
+                running = false;
+                break;
             }
             if (trace) {
                 const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - t0;
@@ -855,20 +877,28 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %s\n", __func__, rpc_log_format_tensor(tensor).c_str(), offset,
              rpc_log_format_size(size).c_str());
     if (rpc_use_hash_cache(tensor, size)) {
-        auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
-        request->tensor = rpc_tensor;
-        request->offset = offset;
-        request->hash = fnv_hash((const uint8_t*)data, size);
-        rpc_msg_set_tensor_hash_rsp response;
-        ctx->dispatcher->send(RPC_CMD_SET_TENSOR_HASH, request, sizeof(*request), &response, sizeof(response));
-        LOG_DBG2("[%s] tensor: %s, hash: 0x%" PRIx64 ", cache: %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),
-                 request->hash, response.result ? "hit" : "miss");
-        if (response.result) {
-            // the server has the same data, no need to send it
-            return;
+        if (g_rpc_skip_hash_probe.load(std::memory_order_relaxed)) {
+            // cold-load fast path: skip the blocking probe AND tell the server not to cache.
+            // DO NOT change cache_flag to 1 here: enabling the server-side cache on this path
+            // regresses to the 83-minute upload ("USB-cache bug") because every tensor forces
+            // a per-weight write to the PS5's slow storage during the upload stream.
+            cache_flag = 0;
+        } else {
+            auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
+            request->tensor = rpc_tensor;
+            request->offset = offset;
+            request->hash = fnv_hash((const uint8_t*)data, size);
+            rpc_msg_set_tensor_hash_rsp response;
+            ctx->dispatcher->send(RPC_CMD_SET_TENSOR_HASH, request, sizeof(*request), &response, sizeof(response));
+            LOG_DBG2("[%s] tensor: %s, hash: 0x%" PRIx64 ", cache: %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),
+                     request->hash, response.result ? "hit" : "miss");
+            if (response.result) {
+                // the server has the same data, no need to send it
+                return;
+            }
+            // the server has no cache entry for this tensor - ask it to save one
+            cache_flag = 1;
         }
-        // the server has no cache entry for this tensor - ask it to save one
-        cache_flag = 1;
     }
     size_t input_size;
     auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
@@ -1158,21 +1188,29 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
     LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %s\n", __func__, rpc_log_format_tensor(tensor).c_str(), offset,
              rpc_log_format_size(size).c_str());
     if (rpc_use_hash_cache(tensor, size)) {
-        auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
-        request->tensor = rpc_tensor;
-        request->offset = offset;
-        request->hash = fnv_hash((const uint8_t*)data, size);
-        rpc_msg_set_tensor_hash_rsp response;
-        // TODO: make this async
-        ctx->dispatcher->send(RPC_CMD_SET_TENSOR_HASH, request, sizeof(*request), &response, sizeof(response));
-        LOG_DBG2("[%s] tensor: %s, hash: 0x%" PRIx64 ", cache: %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),
-                 request->hash, response.result ? "hit" : "miss");
-        if (response.result) {
-            // the server has the same data, no need to send it
-            return;
+        if (g_rpc_skip_hash_probe.load(std::memory_order_relaxed)) {
+            // cold-load fast path: skip the blocking probe AND tell the server not to cache.
+            // DO NOT change cache_flag to 1 here: enabling the server-side cache on this path
+            // regresses to the 83-minute upload ("USB-cache bug") because every tensor forces
+            // a per-weight write to the PS5's slow storage during the upload stream.
+            cache_flag = 0;
+        } else {
+            auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
+            request->tensor = rpc_tensor;
+            request->offset = offset;
+            request->hash = fnv_hash((const uint8_t*)data, size);
+            rpc_msg_set_tensor_hash_rsp response;
+            // TODO: make this async
+            ctx->dispatcher->send(RPC_CMD_SET_TENSOR_HASH, request, sizeof(*request), &response, sizeof(response));
+            LOG_DBG2("[%s] tensor: %s, hash: 0x%" PRIx64 ", cache: %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),
+                     request->hash, response.result ? "hit" : "miss");
+            if (response.result) {
+                // the server has the same data, no need to send it
+                return;
+            }
+            // the server has no cache entry for this tensor - ask it to save one
+            cache_flag = 1;
         }
-        // the server has no cache entry for this tensor - ask it to save one
-        cache_flag = 1;
     }
     size_t input_size;
     auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
@@ -3278,6 +3316,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_rpc_comm_allreduce_tensor;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_set_skip_hash_probe") == 0) {
+        return (void *)ggml_backend_rpc_set_skip_hash_probe;
     }
     return NULL;
 
