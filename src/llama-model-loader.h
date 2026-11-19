@@ -9,9 +9,11 @@
 
 #include "ggml-cpp.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
@@ -265,6 +267,26 @@ struct llama_model_loader {
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);
+
+    // Async RPC upload state: load_all_data populates this lazily across calls so
+    // sibling (ctx, bufs) pairs can pipeline onto different RPC endpoints; drained
+    // and torn down by finalize_async_uploads() after the outer load loop.
+    struct mmap_async_ctx {
+        ggml_backend_t backend = nullptr;
+        bool           owned   = false;
+    };
+    std::unordered_map<ggml_backend_buffer_t, mmap_async_ctx> mmap_async_by_buf;
+    // Guards cross-thread state when load_all_data runs on sibling threads: the async
+    // map above, size_done, the progress_callback invocation, mmaps_used entries,
+    // lmlocks->at(idx)->grow_to writes, and the final-cleanup gate.
+    std::mutex load_mutex;
+    // Set when a thread's progress_callback returns false; peer threads check it between
+    // tensors and bail out cooperatively.
+    std::atomic<bool> load_cancelled{false};
+    // Guarded by load_mutex; claimed once by whichever thread first sees size_done >= size_data.
+    bool final_cleanup_done = false;
+
+    void finalize_async_uploads();
 
     std::string ftype_name() const;
 
