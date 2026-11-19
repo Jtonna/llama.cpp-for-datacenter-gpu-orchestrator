@@ -1,6 +1,8 @@
 # llama.cpp — Jtonna PS5 datacenter fork
 
-> **This is a fork**, not upstream. It carries one additional change on top of a pinned base commit: a parallel RPC tensor-upload patch that pipelines model loading across multiple `rpc-server` backends. On a 3-PS5 split, measured load times drop ~2.3–2.5× (Gemma 12B 66 s → 29 s, Kimi-Dev 72B 286 s → 115 s) with bit-identical inference output. See [`FORK_CHANGES.md`](./FORK_CHANGES.md) for the full rationale, patch summary, build instructions, and the base-commit lock.
+> **This is a fork**, not upstream. It carries one additional change on top of upstream HEAD: a parallel RPC tensor-upload patch that pipelines model loading across multiple `rpc-server` backends. Measured on a 3-PS5 split, load times drop **~2.1–2.35×** (Gemma 12B 66 s → ~30 s, Kimi-Dev 72B 253 s → 115 s) with bit-identical inference output across all 16 tested profiles. Patch is small (**+164/-7 LOC across 3 loader files**, `ggml-rpc.cpp` untouched); upstream PR candidate. See [`FORK_CHANGES.md`](./FORK_CHANGES.md) for rationale, patch summary, build instructions, and benchmark results.
+>
+> **Current branch: `ps5-parallel-upload-head`** (based on upstream HEAD). The older `ps5-parallel-upload` branch (based on `330f018` with the pre-HEAD protocol) is retained for rollback/forensics only.
 >
 > **Upstream** is https://github.com/ggml-org/llama.cpp — go there for issues, PRs, and general use. This fork exists only to serve the [ps5-ai-datacenter-manager](https://github.com/Jtonna/ps5-ai-datacenter-manager) project.
 
