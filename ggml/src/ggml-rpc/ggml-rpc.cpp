@@ -1163,6 +1163,47 @@ static std::chrono::seconds rpc_file_load_timeout(uint64_t size) {
     return std::chrono::seconds(base + (long long) (size / (8*1024*1024)));
 }
 
+// Text safe for the log: client-supplied strings (paths, tensor names) are printed with every byte that is not
+// printable ASCII replaced by '?', and at most max_len bytes of them, so a log never gets binary data from the wire.
+static std::string rpc_log_safe(const char * s, size_t max_len) {
+    std::string out;
+    for (size_t i = 0; i < max_len && s[i] != '\0'; i++) {
+        const unsigned char c = (unsigned char) s[i];
+        out.push_back(c >= 0x20 && c <= 0x7e ? (char) c : '?');
+    }
+    return out;
+}
+
+static std::string rpc_log_safe(const std::string & s) {
+    return rpc_log_safe(s.c_str(), s.size());
+}
+
+// Order-independent digest of the bytes SET_TENSOR_FILE hands to the backend (GGML_RPC_FILE_LOAD_DIGEST=1).
+// Per request (one file range): 64-bit FNV-1a style hash over the file offset, the size and the bytes (8 bytes at a
+// time, little endian, a short tail bytewise; every step is a bijection of the state, so one changed byte always
+// changes the result). The per-request values are added modulo 2^64 into the load digest, so the order in which
+// tensors arrive does not matter.
+static constexpr uint64_t RPC_DIGEST_BASIS = 0xcbf29ce484222325ULL;
+static constexpr uint64_t RPC_DIGEST_PRIME = 0x100000001b3ULL;
+
+static inline uint64_t rpc_digest_word(uint64_t h, uint64_t w) {
+    return (h ^ w) * RPC_DIGEST_PRIME;
+}
+
+// data of one chunk; only the last chunk of a range can have a tail (chunks are a multiple of 8 bytes)
+static uint64_t rpc_digest_bytes(uint64_t h, const char * p, size_t n) {
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h = rpc_digest_word(h, w);
+    }
+    for (; i < n; i++) {
+        h = (h ^ (uint8_t) p[i]) * RPC_DIGEST_PRIME;
+    }
+    return h;
+}
+
 // request header followed by the path bytes, as FILE_IDENTITY and SET_TENSOR_FILE expect
 template <typename T>
 static std::shared_ptr<uint8_t> rpc_pack_path_msg(const T & hdr, const char * path, size_t path_len, size_t & input_size) {
@@ -1765,6 +1806,8 @@ class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, const fs::path & model_dir = {})
         : backends(std::move(all_backends)), cache_dir(cache_dir), model_dir(model_dir) {
+        const char * dg = getenv("GGML_RPC_FILE_LOAD_DIGEST");
+        file_load_digest = dg != nullptr && dg[0] == '1';
         stored_graphs.resize(backends.size());
         comm_states.resize(backends.size());
     }
@@ -1849,6 +1892,8 @@ private:
         uint64_t bytes        = 0;
         uint64_t tensors      = 0;
         uint64_t bytes_logged = 0;
+        // GGML_RPC_FILE_LOAD_DIGEST=1: sum of the per-request digests of the bytes handed to the backend
+        uint64_t digest       = 0;
         // sums of the totals announced with extended FILE_IDENTITY requests that passed; logged only if has_total
         bool     has_total     = false;
         uint64_t total_bytes   = 0;
@@ -1856,6 +1901,8 @@ private:
         std::chrono::steady_clock::time_point t_start;
         std::chrono::steady_clock::time_point t_logged;
     } file_load;
+    // GGML_RPC_FILE_LOAD_DIGEST=1 in the server environment: "[file_load] done" gets a digest= field
+    bool file_load_digest = false;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // computed graphs cached per backend, keyed by uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
@@ -2094,7 +2141,7 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
             tensor->data < buffer_start || tensor->data + tensor_size > buffer_start + buffer_size) {
             LOG_ERROR("[%s] tensor '%s' (op %s, type %s, ne [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]) "
                       "data [0x%" PRIx64 ", 0x%" PRIx64 ") out of buffer bounds [0x%" PRIx64 ", 0x%" PRIx64 ")\n",
-                      __func__, tensor->name, ggml_op_name((ggml_op) tensor->op), ggml_type_name(result->type),
+                      __func__, rpc_log_safe(tensor->name, GGML_MAX_NAME).c_str(), ggml_op_name((ggml_op) tensor->op), ggml_type_name(result->type),
                       result->ne[0], result->ne[1], result->ne[2], result->ne[3],
                       tensor->data, tensor->data + tensor_size, buffer_start, buffer_start + buffer_size);
             return nullptr;
@@ -2406,13 +2453,13 @@ bool rpc_server::file_identity(const std::vector<uint8_t> & input, rpc_msg_file_
         response_size = sizeof(rpc_msg_file_identity_rsp_ext);
     }
     if (model_dir.empty()) {
-        LOG_ERROR("[%s] refused '%s': rpc-server was started without --model-dir\n", __func__, req_path.c_str());
+        LOG_ERROR("[%s] refused '%s': rpc-server was started without --model-dir\n", __func__, rpc_log_safe(req_path).c_str());
         return true;
     }
     fs::path file_path;
     if (!rpc_resolve_model_file(model_dir, req_path, file_path)) {
         LOG_ERROR("[%s] refused '%s': not an existing regular file inside --model-dir '%s'\n",
-                  __func__, req_path.c_str(), model_dir.string().c_str());
+                  __func__, rpc_log_safe(req_path).c_str(), model_dir.string().c_str());
         return true;
     }
     const std::string key = file_path.string();
@@ -2442,14 +2489,14 @@ bool rpc_server::file_identity(const std::vector<uint8_t> & input, rpc_msg_file_
     }
     if (has_totals) {
         LOG_INFO("[%s] loading tensor data from local file '%s' (client path '%s', digest %016" PRIx64 "), client announced "
-                 "%" PRIu64 " tensors, %" PRIu64 " bytes\n", __func__, key.c_str(), req_path.c_str(), digest,
+                 "%" PRIu64 " tensors, %" PRIu64 " bytes\n", __func__, key.c_str(), rpc_log_safe(req_path).c_str(), digest,
                  (uint64_t) totals.n_tensors, (uint64_t) totals.n_bytes);
         file_load.has_total      = true;
         file_load.total_bytes   += totals.n_bytes;
         file_load.total_tensors += totals.n_tensors;
     } else {
         LOG_INFO("[%s] loading tensor data from local file '%s' (client path '%s', digest %016" PRIx64 ")\n",
-                 __func__, key.c_str(), req_path.c_str(), digest);
+                 __func__, key.c_str(), rpc_log_safe(req_path).c_str(), digest);
     }
     tensor_files[key] = std::move(ifs);
     response.result = 1;
@@ -2470,12 +2517,16 @@ void rpc_server::file_load_log(bool done) {
         return;
     }
     const long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - file_load.t_start).count();
+    char digest_field[40] = "";
+    if (done && file_load_digest) {
+        snprintf(digest_field, sizeof(digest_field), " digest=%016" PRIx64, file_load.digest);
+    }
     if (file_load.has_total) {
-        LOG_INFO("[file_load] %s bytes=%" PRIu64 " total=%" PRIu64 " tensors=%" PRIu64 " tensors_total=%" PRIu64 " elapsed_ms=%lld\n",
-                 done ? "done" : "progress", file_load.bytes, file_load.total_bytes, file_load.tensors, file_load.total_tensors, elapsed_ms);
+        LOG_INFO("[file_load] %s bytes=%" PRIu64 " total=%" PRIu64 " tensors=%" PRIu64 " tensors_total=%" PRIu64 " elapsed_ms=%lld%s\n",
+                 done ? "done" : "progress", file_load.bytes, file_load.total_bytes, file_load.tensors, file_load.total_tensors, elapsed_ms, digest_field);
     } else {
-        LOG_INFO("[file_load] %s bytes=%" PRIu64 " tensors=%" PRIu64 " elapsed_ms=%lld\n",
-                 done ? "done" : "progress", file_load.bytes, file_load.tensors, elapsed_ms);
+        LOG_INFO("[file_load] %s bytes=%" PRIu64 " tensors=%" PRIu64 " elapsed_ms=%lld%s\n",
+                 done ? "done" : "progress", file_load.bytes, file_load.tensors, elapsed_ms, digest_field);
     }
     if (done) {
         file_load = file_load_stats();
@@ -2495,7 +2546,7 @@ bool rpc_server::set_tensor_file(const std::vector<uint8_t> & input, rpc_msg_set
     }
 
     if (model_dir.empty()) {
-        LOG_ERROR("[%s] refused '%s': rpc-server was started without --model-dir\n", __func__, req_path.c_str());
+        LOG_ERROR("[%s] refused '%s': rpc-server was started without --model-dir\n", __func__, rpc_log_safe(req_path).c_str());
         return true;
     }
 
@@ -2530,7 +2581,7 @@ bool rpc_server::set_tensor_file(const std::vector<uint8_t> & input, rpc_msg_set
     fs::path file_path;
     if (!rpc_resolve_model_file(model_dir, req_path, file_path)) {
         LOG_ERROR("[%s] refused '%s': not an existing regular file inside --model-dir '%s'\n",
-                  __func__, req_path.c_str(), model_dir.string().c_str());
+                  __func__, rpc_log_safe(req_path).c_str(), model_dir.string().c_str());
         return true;
     }
     std::error_code ec;
@@ -2568,6 +2619,7 @@ bool rpc_server::set_tensor_file(const std::vector<uint8_t> & input, rpc_msg_set
     }
     ifs.clear();
     ifs.seekg((std::streamoff) request.file_offset, std::ios::beg);
+    uint64_t range_digest = rpc_digest_word(rpc_digest_word(RPC_DIGEST_BASIS, request.file_offset), request.size);
     for (uint64_t done = 0; done < request.size; ) {
         const size_t n = (size_t) std::min<uint64_t>(request.size - done, chunk_size);
         // host buffers (CPU backend) are read into directly, others are staged through set_tensor_buf
@@ -2580,6 +2632,10 @@ bool rpc_server::set_tensor_file(const std::vector<uint8_t> & input, rpc_msg_set
             tensor_files.erase(it);
             return true;
         }
+        if (file_load_digest) {
+            // exactly the bytes the backend gets: the destination for host buffers, the staging buffer otherwise
+            range_digest = rpc_digest_bytes(range_digest, dst, n);
+        }
         if (!is_host) {
             ggml_backend_tensor_set(tensor, dst, request.offset + done, n);
         }
@@ -2588,6 +2644,7 @@ bool rpc_server::set_tensor_file(const std::vector<uint8_t> & input, rpc_msg_set
         file_load_log(false);
     }
     file_load.tensors++;
+    file_load.digest += range_digest;
     response.result = 1;
     return true;
 }
