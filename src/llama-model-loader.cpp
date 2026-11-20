@@ -12,6 +12,8 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include <filesystem>
 #include <future>
 #include <regex>
 #include <thread>
@@ -21,6 +23,14 @@
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+// absolute (not canonical: symlinks are left for the RPC server to resolve against its own mount)
+// path of a model file, sent to RPC servers that can read tensor data from their own copy
+static std::string rpc_file_path(const std::string & fname) {
+    std::error_code ec;
+    auto p = std::filesystem::absolute(fname, ec);
+    return ec ? fname : p.lexically_normal().string();
+}
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -585,6 +595,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.push_back(rpc_file_path(fname));
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -715,6 +726,7 @@ llama_model_loader::llama_model_loader(
             }
 
             files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+            file_paths.push_back(rpc_file_path(fname_split));
             contexts.emplace_back(std::move(ctx_ptr));
             if (idx < n_backbone) {
                 n_backbone_files = files.size();
@@ -786,6 +798,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(file));
+        file_paths.emplace_back(); // no path: never loaded by RPC servers from their own copy
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -1505,6 +1518,40 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
+bool llama_model_loader::init_rpc_file_load() {
+    rpc_set_tensor_file = nullptr;
+    const char * env = std::getenv("LLAMA_RPC_FILE_LOAD");
+    if (env != nullptr && std::strcmp(env, "0") == 0) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+    if (reg == nullptr) {
+        return false;
+    }
+    auto supports_fn = (bool (*)(ggml_backend_buffer_type_t))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buft_supports_set_tensor_file");
+    auto set_fn = (rpc_set_tensor_file_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buffer_set_tensor_from_file");
+    if (supports_fn == nullptr || set_fn == nullptr) {
+        return false;
+    }
+    bool any = false;
+    for (const auto & [ctx_key, ctx_ptr] : ctx_map) {
+        if (!ctx_ptr || ggml_get_first_tensor(ctx_ptr.get()) == nullptr) {
+            continue;
+        }
+        if (supports_fn(ctx_key.buft)) {
+            LLAMA_LOG_INFO("%s: %s can read its tensor data from its own copy of the model file\n",
+                __func__, ggml_backend_buft_name(ctx_key.buft));
+            any = true;
+        }
+    }
+    if (any) {
+        rpc_set_tensor_file = set_fn;
+    }
+    return any;
+}
+
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
@@ -1843,6 +1890,21 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
+        // RPC servers started with --model-dir read their share straight from their own copy of the
+        // file, so this process neither reads nor sends those bytes. Falls back to the normal upload
+        // below when the server refuses (missing file, size mismatch, path outside its model dir).
+        if (rpc_set_tensor_file && cur->buffer && cur->data && !lazy.has(cur) && !check_tensors &&
+                weight->idx < file_paths.size() && !file_paths[weight->idx].empty()) {
+            const auto & file = files.at(weight->idx);
+            if (rpc_set_tensor_file(cur, file_paths[weight->idx].c_str(), weight->offs, file->size(), 0, n_size)) {
+                std::lock_guard<std::mutex> lk(load_mutex);
+                size_done += n_size;
+                rpc_file_tensors++;
+                rpc_file_bytes += n_size;
+                continue;
+            }
+        }
+
         const bool from_mapping = use_mmap || lazy.has(cur);
 
         if (from_mapping) {
@@ -2083,6 +2145,10 @@ bool llama_model_loader::load_all_data(
 }
 
 void llama_model_loader::finalize_async_uploads() {
+    if (rpc_set_tensor_file) {
+        LLAMA_LOG_INFO("%s: %zu tensors (%.2f MiB) were read by RPC servers from their own copy of the model file\n",
+            __func__, rpc_file_tensors, rpc_file_bytes / 1024.0 / 1024.0);
+    }
     if (mmap_async_by_buf.empty()) {
         return;
     }

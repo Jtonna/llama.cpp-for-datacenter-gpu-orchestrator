@@ -32,6 +32,23 @@ GGML_BACKEND_API void ggml_backend_rpc_start_server(
         size_t n_devices,
         ggml_backend_dev_t * devices);
 
+// fork extension: model_dir enables RPC_CMD_SET_TENSOR_FILE, restricted to files inside that directory (NULL = disabled)
+GGML_BACKEND_API void ggml_backend_rpc_start_server_ext(
+        const char * endpoint,
+        const char * cache_dir,
+        const char * model_dir,
+        size_t n_threads,
+        size_t n_devices,
+        ggml_backend_dev_t * devices);
+
+// fork extension: let the RPC server owning tensor->buffer read the bytes from its own copy of `path`.
+// Returns false without writing anything usable if unsupported/refused; the caller must then upload the data itself.
+GGML_BACKEND_API bool ggml_backend_rpc_buffer_set_tensor_from_file(struct ggml_tensor * tensor, const char * path,
+        uint64_t file_offset, uint64_t file_size, size_t offset, size_t size);
+
+// fork extension: true if buft is an RPC buffer type whose server accepts set_tensor_from_file
+GGML_BACKEND_API bool ggml_backend_rpc_buft_supports_set_tensor_file(ggml_backend_buffer_type_t buft);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
 

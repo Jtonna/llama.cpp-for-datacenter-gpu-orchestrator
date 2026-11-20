@@ -118,6 +118,8 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
+    // absolute path of each entry in files (empty when loaded from a FILE *)
+    std::vector<std::string> file_paths;
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -293,6 +295,17 @@ struct llama_model_loader {
     bool final_cleanup_done = false;
 
     void finalize_async_uploads();
+
+    // RPC direct file load (fork extension): when an RPC server advertises it, tensors in its buffers
+    // are loaded by the server from its own copy of the model file (ggml_backend_rpc_buffer_set_tensor_from_file)
+    using rpc_set_tensor_file_t = bool (*)(ggml_tensor * tensor, const char * path, uint64_t file_offset,
+                                           uint64_t file_size, size_t offset, size_t size);
+    rpc_set_tensor_file_t rpc_set_tensor_file = nullptr;
+    size_t rpc_file_tensors = 0; // guarded by load_mutex
+    size_t rpc_file_bytes   = 0; // guarded by load_mutex
+    // call after the tensors were created (ctx_map is filled); returns true if any context is served by
+    // such a server, in which case the caller should not prefetch the whole mapping. LLAMA_RPC_FILE_LOAD=0 disables it.
+    bool init_rpc_file_load();
 
     std::string ftype_name() const;
 

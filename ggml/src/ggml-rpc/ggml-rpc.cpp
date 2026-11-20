@@ -78,6 +78,8 @@ enum rpc_cmd {
     RPC_CMD_COMM_INIT,
     RPC_CMD_COMM_ALLREDUCE,
     RPC_CMD_COMM_FREE,
+    // fork extension: only sent when the server advertises RPC_DISPATCHER_FLAGS_SET_TENSOR_FILE
+    RPC_CMD_SET_TENSOR_FILE,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -109,7 +111,8 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
         case RPC_CMD_COMM_INIT:         return "COMM_INIT";
         case RPC_CMD_COMM_ALLREDUCE:    return "COMM_ALLREDUCE";
         case RPC_CMD_COMM_FREE:         return "COMM_FREE";
-        case RPC_CMD_NONE:              return "NONE";
+        case RPC_CMD_SET_TENSOR_FILE:   return "SET_TENSOR_FILE";
+        case RPC_CMD_NONE:             return "NONE";
         default:                        return "UNKNOWN";
     }
 }
@@ -128,6 +131,9 @@ struct rpc_msg_hello_req {
 // server feature flags in rpc_msg_hello_rsp::flags
 enum rpc_dispatcher_flags : uint8_t {
     RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH = 1 << 0, // client should try SET_TENSOR_HASH before sending tensor data
+    // fork extension (high bit to stay clear of upstream flag allocations): the server was started
+    // with --model-dir and accepts RPC_CMD_SET_TENSOR_FILE. Stock clients ignore unknown bits.
+    RPC_DISPATCHER_FLAGS_SET_TENSOR_FILE  = 1 << 7,
 };
 
 struct rpc_msg_hello_rsp {
@@ -214,6 +220,22 @@ struct rpc_msg_set_tensor_hash_req {
 
 struct rpc_msg_set_tensor_hash_rsp {
     uint8_t result;
+};
+
+// RPC_CMD_SET_TENSOR_FILE request: this header followed by path_len bytes of path (no NUL)
+// the server reads [file_offset, file_offset + size) of its own copy of the file into
+// [offset, offset + size) of the tensor
+struct rpc_msg_set_tensor_file_req {
+    rpc_tensor tensor;
+    uint64_t offset;      // offset inside the tensor
+    uint64_t size;        // number of bytes
+    uint64_t file_offset; // offset inside the file
+    uint64_t file_size;   // total size of the client's file, the server's copy must match
+    uint32_t path_len;
+};
+
+struct rpc_msg_set_tensor_file_rsp {
+    uint8_t result; // 1 = data loaded, 0 = refused or failed (client must send the data itself)
 };
 
 struct rpc_msg_get_tensor_req {
@@ -533,6 +555,10 @@ public:
     void work();
 
     bool get_send_tensor_hash() const { return flags & RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH; }
+    bool get_set_tensor_file() const { return flags & RPC_DISPATCHER_FLAGS_SET_TENSOR_FILE; }
+
+    // set after the first refused SET_TENSOR_FILE, so the remaining tensors go straight to the normal upload
+    std::atomic_bool set_tensor_file_disabled{false};
 
     ~rpc_dispatcher();
 
@@ -1001,6 +1027,62 @@ static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t
     return buft_ctx->name.c_str();
 }
 
+// fork extension: ask the server owning tensor->buffer to fill [offset, offset + size) of the tensor from
+// [file_offset, file_offset + size) of its own copy of `path`, instead of sending the bytes.
+// Returns false (and nothing is written) when the buffer is not an RPC buffer, the server did not
+// advertise the capability, or the server refused/failed; the caller must then upload the data itself.
+bool ggml_backend_rpc_buffer_set_tensor_from_file(ggml_tensor * tensor, const char * path, uint64_t file_offset,
+                                                  uint64_t file_size, size_t offset, size_t size) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_rpc(tensor->buffer) ||
+        path == nullptr || path[0] == '\0') {
+        return false;
+    }
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)tensor->buffer->context;
+    rpc_dispatcher & dispatcher = *ctx->dispatcher;
+    if (!dispatcher.get_set_tensor_file() || dispatcher.set_tensor_file_disabled.load()) {
+        return false;
+    }
+    const size_t path_len = strlen(path);
+    if (path_len > 4096) {
+        return false;
+    }
+    rpc_msg_set_tensor_file_req hdr = {};
+    hdr.tensor      = serialize_tensor(tensor);
+    hdr.offset      = offset;
+    hdr.size        = size;
+    hdr.file_offset = file_offset;
+    hdr.file_size   = file_size;
+    hdr.path_len    = (uint32_t) path_len;
+    const size_t input_size = sizeof(hdr) + path_len;
+    uint8_t * input = new uint8_t[input_size];
+    memcpy(input, &hdr, sizeof(hdr));
+    memcpy(input + sizeof(hdr), path, path_len);
+    std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+
+    rpc_msg_set_tensor_file_rsp response = {};
+    dispatcher.send(RPC_CMD_SET_TENSOR_FILE, input_ptr, input_size, nullptr, 0, &response, sizeof(response));
+    LOG_DBG2("[%s] tensor: %s, file: %s @ %" PRIu64 ", size: %s -> %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),
+             path, file_offset, rpc_log_format_size(size).c_str(), response.result ? "ok" : "refused");
+    if (!response.result) {
+        if (!dispatcher.set_tensor_file_disabled.exchange(true)) {
+            LOG_WARN("[%s] RPC server refused to load '%s' from its local file (see the rpc-server log); "
+                     "falling back to sending tensor data for this server\n", __func__, path);
+        }
+        return false;
+    }
+    return true;
+}
+
+// fork extension: true if buft is an RPC buffer type whose server accepts RPC_CMD_SET_TENSOR_FILE
+bool ggml_backend_rpc_buft_supports_set_tensor_file(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr || buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
+        return false;
+    }
+    ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
+    auto dispatcher = get_dispatcher(buft_ctx->endpoint);
+    return dispatcher != nullptr && dispatcher->get_set_tensor_file();
+}
+
 static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
     auto request = std::make_shared<rpc_msg_alloc_buffer_req>();
@@ -1427,8 +1509,8 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 
 class rpc_server {
 public:
-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
-        : backends(std::move(all_backends)), cache_dir(cache_dir) {
+    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, const fs::path & model_dir = {})
+        : backends(std::move(all_backends)), cache_dir(cache_dir), model_dir(model_dir) {
         stored_graphs.resize(backends.size());
         comm_states.resize(backends.size());
     }
@@ -1445,6 +1527,7 @@ public:
     bool set_tensor(socket_ptr sock, uint64_t input_size);
     bool set_tensor_2d(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
+    bool set_tensor_file(const std::vector<uint8_t> & input, rpc_msg_set_tensor_file_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -1499,6 +1582,10 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
+    // canonical allow-listed directory for SET_TENSOR_FILE; empty = feature disabled
+    fs::path model_dir;
+    // files opened by SET_TENSOR_FILE, keyed by the canonical path, kept open for the connection
+    std::unordered_map<std::string, std::unique_ptr<std::ifstream>> tensor_files;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // computed graphs cached per backend, keyed by uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
@@ -1512,6 +1599,9 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
     response.flags = cache_dir ? RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH : 0;
+    if (!model_dir.empty()) {
+        response.flags |= RPC_DISPATCHER_FLAGS_SET_TENSOR_FILE;
+    }
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
@@ -1956,6 +2046,157 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
         }
     }
     ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+    response.result = 1;
+    return true;
+}
+
+// true if `p` (canonical) is `dir` (canonical) or below it, compared component by component
+static bool rpc_path_is_within(const fs::path & dir, const fs::path & p) {
+    auto it_d = dir.begin();
+    auto it_p = p.begin();
+    for (; it_d != dir.end(); ++it_d, ++it_p) {
+        if (it_d->empty()) {
+            continue; // trailing separator
+        }
+        if (it_p == p.end() || *it_d != *it_p) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Resolve a client-supplied path to a canonical regular file inside model_dir.
+// Tried in order: the path as given (relative paths are taken relative to model_dir), then
+// model_dir/<file name>, which covers a client that mounts the same export somewhere else.
+// Symlinks are resolved before the containment check, so a link pointing outside is refused.
+static bool rpc_resolve_model_file(const fs::path & model_dir, const std::string & req, fs::path & out) {
+    const fs::path req_path(req);
+    std::vector<fs::path> candidates;
+    candidates.push_back(req_path.is_absolute() ? req_path : model_dir / req_path);
+    if (req_path.has_filename()) {
+        candidates.push_back(model_dir / req_path.filename());
+    }
+    for (const auto & cand : candidates) {
+        std::error_code ec;
+        fs::path c = fs::canonical(cand, ec);
+        if (ec || !rpc_path_is_within(model_dir, c) || !fs::is_regular_file(c, ec) || ec) {
+            continue;
+        }
+        out = c;
+        return true;
+    }
+    return false;
+}
+
+bool rpc_server::set_tensor_file(const std::vector<uint8_t> & input, rpc_msg_set_tensor_file_rsp & response) {
+    // malformed messages close the connection (return false), refusals only answer result = 0
+    response.result = 0;
+    if (input.size() < sizeof(rpc_msg_set_tensor_file_req)) {
+        return false;
+    }
+    rpc_msg_set_tensor_file_req request;
+    memcpy(&request, input.data(), sizeof(request));
+    if (request.path_len == 0 || request.path_len > 4096 || input.size() != sizeof(request) + request.path_len) {
+        return false;
+    }
+    const std::string req_path((const char *) input.data() + sizeof(request), request.path_len);
+    if (req_path.find('\0') != std::string::npos) {
+        return false;
+    }
+
+    if (model_dir.empty()) {
+        LOG_ERROR("[%s] refused '%s': rpc-server was started without --model-dir\n", __func__, req_path.c_str());
+        return true;
+    }
+
+    sync_all_backends();
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+
+    // sanitize the destination region, same rule as set_tensor
+    {
+        const uint64_t p0 = (uint64_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const uint64_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        const uint64_t d  = request.tensor.data;
+        if (request.offset > UINT64_MAX - d || d + request.offset < p0 || d + request.offset >= p1 ||
+            request.size > p1 - d - request.offset) {
+            LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%" PRIu64 ") out of buffer bounds [0x%" PRIx64 ", 0x%" PRIx64 ")\n",
+                      __func__, d, request.offset, request.size, p0, p1);
+            return false;
+        }
+    }
+
+    fs::path file_path;
+    if (!rpc_resolve_model_file(model_dir, req_path, file_path)) {
+        LOG_ERROR("[%s] refused '%s': not an existing regular file inside --model-dir '%s'\n",
+                  __func__, req_path.c_str(), model_dir.string().c_str());
+        return true;
+    }
+    std::error_code ec;
+    const uint64_t file_size = fs::file_size(file_path, ec);
+    if (ec || file_size != request.file_size) {
+        LOG_ERROR("[%s] refused '%s': local file size %" PRIu64 " != client file size %" PRIu64 " (different file?)\n",
+                  __func__, file_path.string().c_str(), ec ? 0 : file_size, request.file_size);
+        return true;
+    }
+    if (request.file_offset > file_size || request.size > file_size - request.file_offset) {
+        LOG_ERROR("[%s] refused '%s': range [%" PRIu64 ", +%" PRIu64 ") beyond end of file (%" PRIu64 ")\n",
+                  __func__, file_path.string().c_str(), request.file_offset, request.size, file_size);
+        return true;
+    }
+
+    const std::string key = file_path.string();
+    auto it = tensor_files.find(key);
+    if (it == tensor_files.end()) {
+        auto ifs = std::make_unique<std::ifstream>(file_path, std::ios::binary);
+        if (!ifs->is_open()) {
+            LOG_ERROR("[%s] refused '%s': open failed\n", __func__, key.c_str());
+            return true;
+        }
+        LOG_INFO("[%s] loading tensor data from local file '%s' (client path '%s')\n", __func__, key.c_str(), req_path.c_str());
+        it = tensor_files.emplace(key, std::move(ifs)).first;
+    }
+    std::ifstream & ifs = *it->second;
+
+    LOG_DBG2("[%s] tensor: %s, offset: %" PRIu64 ", size: %s, file: %s @ %" PRIu64 "\n", __func__,
+             rpc_log_format_tensor(tensor).c_str(), request.offset, rpc_log_format_size(request.size).c_str(),
+             key.c_str(), request.file_offset);
+
+    const bool is_host = ggml_backend_buffer_is_host(tensor->buffer);
+    const size_t chunk_size = 16*1024*1024;
+    if (!is_host && set_tensor_buf.size() < std::min<uint64_t>(request.size, chunk_size)) {
+        set_tensor_buf.resize(std::min<uint64_t>(request.size, chunk_size));
+    }
+    ifs.clear();
+    ifs.seekg((std::streamoff) request.file_offset, std::ios::beg);
+    for (uint64_t done = 0; done < request.size; ) {
+        const size_t n = (size_t) std::min<uint64_t>(request.size - done, chunk_size);
+        // host buffers (CPU backend) are read into directly, others are staged through set_tensor_buf
+        char * dst = is_host ? (char *) tensor->data + request.offset + done : (char *) set_tensor_buf.data();
+        ifs.read(dst, (std::streamsize) n);
+        if (!ifs || (size_t) ifs.gcount() != n) {
+            // the region may now be partially written; the client re-sends the whole region on fallback
+            LOG_ERROR("[%s] read of '%s' failed at offset %" PRIu64 " (got %zu of %zu bytes)\n", __func__, key.c_str(),
+                      request.file_offset + done, (size_t) ifs.gcount(), n);
+            tensor_files.erase(it);
+            return true;
+        }
+        if (!is_host) {
+            ggml_backend_tensor_set(tensor, dst, request.offset + done, n);
+        }
+        done += n;
+    }
     response.result = 1;
     return true;
 }
@@ -2658,8 +2899,8 @@ rpc_server::~rpc_server() {
 }
 
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             socket_ptr sock) {
-    rpc_server server(backends, cache_dir);
+                             const fs::path & model_dir, socket_ptr sock) {
+    rpc_server server(backends, cache_dir, model_dir);
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -2871,6 +3112,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_SET_TENSOR_FILE: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                rpc_msg_set_tensor_file_rsp response;
+                if (!server.set_tensor_file(input, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_INIT_TENSOR: {
                 rpc_msg_init_tensor_req request;
                 if (!recv_msg(sock, &request,sizeof(request))) {
@@ -2987,9 +3242,23 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+    ggml_backend_rpc_start_server_ext(endpoint, cache_dir, nullptr, n_threads, n_devices, devices);
+}
+
+void ggml_backend_rpc_start_server_ext(const char * endpoint, const char * cache_dir, const char * model_dir,
+                                       size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
     if (n_devices == 0 || devices == nullptr) {
         LOG_ERROR("Invalid arguments to ggml_backend_rpc_start_server\n");
         return;
+    }
+    fs::path model_dir_path;
+    if (model_dir != nullptr && model_dir[0] != '\0') {
+        std::error_code ec;
+        model_dir_path = fs::canonical(model_dir, ec);
+        if (ec || !fs::is_directory(model_dir_path, ec)) {
+            LOG_ERROR("Invalid --model-dir '%s': not an existing directory\n", model_dir);
+            return;
+        }
     }
     std::vector<ggml_backend_t> backends;
     LOG_INFO("Starting RPC server v%d.%d.%d\n",
@@ -2998,6 +3267,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         RPC_PROTO_PATCH_VERSION);
     LOG_INFO("  endpoint       : %s\n", endpoint);
     LOG_INFO("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
+    LOG_INFO("  model dir      : %s\n", model_dir_path.empty() ? "n/a" : model_dir_path.string().c_str());
     LOG_INFO("Devices:\n");
     for (size_t i = 0; i < n_devices; i++) {
         auto dev = devices[i];
@@ -3047,7 +3317,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
             return;
         }
         LOG_INFO("Accepted client connection\n");
-        rpc_serve_client(backends, cache_dir, client_socket);
+        rpc_serve_client(backends, cache_dir, model_dir_path, client_socket);
         LOG_INFO("Client connection closed\n");
     }
     rpc_transport_shutdown();
@@ -3336,6 +3606,15 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_start_server_ext") == 0) {
+        return (void *)ggml_backend_rpc_start_server_ext;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_buffer_set_tensor_from_file") == 0) {
+        return (void *)ggml_backend_rpc_buffer_set_tensor_from_file;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_buft_supports_set_tensor_file") == 0) {
+        return (void *)ggml_backend_rpc_buft_supports_set_tensor_file;
     }
     if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_rpc_comm_init;

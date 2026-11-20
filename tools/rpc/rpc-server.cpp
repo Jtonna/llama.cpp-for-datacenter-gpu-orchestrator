@@ -79,7 +79,8 @@ struct rpc_server_params {
     std::string              host        = "127.0.0.1";
     int                      port        = 50052;
     bool                     use_cache   = false;
-    int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
+    std::string              model_dir;
+    int                    n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
 };
 
@@ -92,6 +93,8 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr, "  -m, --model-dir DIR              let clients ask this server to read tensor data from model files\n");
+    fprintf(stderr, "                                   inside DIR (read-only use; any path outside DIR is refused)\n");
     fprintf(stderr, "\n");
 }
 
@@ -139,6 +142,16 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             }
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
+        } else if (arg == "-m" || arg == "--model-dir") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.model_dir = argv[i];
+            std::error_code ec;
+            if (!std::filesystem::is_directory(params.model_dir, ec)) {
+                fprintf(stderr, "error: --model-dir '%s' is not a directory\n", params.model_dir.c_str());
+                return false;
+            }
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -241,12 +254,13 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    auto start_server_fn = (decltype(ggml_backend_rpc_start_server)*) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server");
+    auto start_server_fn = (decltype(ggml_backend_rpc_start_server_ext)*) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server_ext");
     if (!start_server_fn) {
         fprintf(stderr, "Failed to obtain RPC backend start server function\n");
         return 1;
     }
 
-    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
+    start_server_fn(endpoint.c_str(), cache_dir, params.model_dir.empty() ? nullptr : params.model_dir.c_str(),
+                    params.n_threads, devices.size(), devices.data());
     return 0;
 }

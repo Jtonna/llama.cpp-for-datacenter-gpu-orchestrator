@@ -2038,7 +2038,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // when RPC servers read their share from their own copy of the file, prefetching the whole mapping
+    // (MAP_POPULATE / WILLNEED) would still pull every byte through this host, e.g. over NFS
+    bool prefetch = true;
+    if (!ml.no_alloc && ml.init_rpc_file_load()) {
+        LLAMA_LOG_INFO("%s: RPC file load enabled, not prefetching the model mapping\n", __func__);
+        prefetch = false;
+    }
+    ml.init_mappings(prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
