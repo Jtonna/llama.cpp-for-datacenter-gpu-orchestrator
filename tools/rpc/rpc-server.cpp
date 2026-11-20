@@ -80,7 +80,7 @@ struct rpc_server_params {
     int                      port        = 50052;
     bool                     use_cache   = false;
     std::string              model_dir;
-    int                    n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
+    int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
 };
 
@@ -94,7 +94,8 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
     fprintf(stderr, "  -m, --model-dir DIR              let clients ask this server to read tensor data from model files\n");
-    fprintf(stderr, "                                   inside DIR (read-only use; any path outside DIR is refused)\n");
+    fprintf(stderr, "                                   inside DIR (read-only use; any path outside DIR is refused; a file is\n");
+    fprintf(stderr, "                                   only used if its size, header and sampled blocks match the client's)\n");
     fprintf(stderr, "\n");
 }
 

@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
+#include "gguf.h"
 #include "transport.h"
 #include "log.h"
 
@@ -80,6 +81,7 @@ enum rpc_cmd {
     RPC_CMD_COMM_FREE,
     // fork extension: only sent when the server advertises RPC_DISPATCHER_FLAGS_SET_TENSOR_FILE
     RPC_CMD_SET_TENSOR_FILE,
+    RPC_CMD_FILE_IDENTITY,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -112,7 +114,8 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
         case RPC_CMD_COMM_ALLREDUCE:    return "COMM_ALLREDUCE";
         case RPC_CMD_COMM_FREE:         return "COMM_FREE";
         case RPC_CMD_SET_TENSOR_FILE:   return "SET_TENSOR_FILE";
-        case RPC_CMD_NONE:             return "NONE";
+        case RPC_CMD_FILE_IDENTITY:     return "FILE_IDENTITY";
+        case RPC_CMD_NONE:              return "NONE";
         default:                        return "UNKNOWN";
     }
 }
@@ -131,9 +134,11 @@ struct rpc_msg_hello_req {
 // server feature flags in rpc_msg_hello_rsp::flags
 enum rpc_dispatcher_flags : uint8_t {
     RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH = 1 << 0, // client should try SET_TENSOR_HASH before sending tensor data
-    // fork extension (high bit to stay clear of upstream flag allocations): the server was started
-    // with --model-dir and accepts RPC_CMD_SET_TENSOR_FILE. Stock clients ignore unknown bits.
-    RPC_DISPATCHER_FLAGS_SET_TENSOR_FILE  = 1 << 7,
+    // fork extension (high bits to stay clear of upstream flag allocations): the server was started
+    // with --model-dir and accepts RPC_CMD_FILE_IDENTITY + RPC_CMD_SET_TENSOR_FILE. Stock clients ignore unknown bits.
+    // 1 << 7 was the first version of the extension (file size check only); it is no longer advertised,
+    // so clients of that version keep sending tensor data to these servers instead of skipping the check.
+    RPC_DISPATCHER_FLAGS_SET_TENSOR_FILE  = 1 << 6,
 };
 
 struct rpc_msg_hello_rsp {
@@ -236,6 +241,20 @@ struct rpc_msg_set_tensor_file_req {
 
 struct rpc_msg_set_tensor_file_rsp {
     uint8_t result; // 1 = data loaded, 0 = refused or failed (client must send the data itself)
+};
+
+// RPC_CMD_FILE_IDENTITY request: this header followed by path_len bytes of path (no NUL).
+// Must succeed for a file before the server accepts RPC_CMD_SET_TENSOR_FILE for it (see rpc_file_digest)
+struct rpc_msg_file_identity_req {
+    uint64_t file_size; // total size of the client's file
+    uint64_t head_size; // bytes at the start of the file hashed in full (GGUF header, metadata, tensor infos)
+    uint64_t digest;    // rpc_file_digest of the client's file
+    uint32_t path_len;
+};
+
+struct rpc_msg_file_identity_rsp {
+    uint8_t  result; // 1 = same file, 0 = refused or different (client must send the data itself)
+    uint64_t digest; // rpc_file_digest of the server's copy, 0 if it was not found or could not be read
 };
 
 struct rpc_msg_get_tensor_req {
@@ -345,6 +364,48 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = 0xcbf
         hash *= fnv_prime;
     }
     return hash;
+}
+
+// fork extension: cheap identity of a model file that may be tens of GB on a network share, computed by
+// both the client and the RPC server before the server loads tensor data from its own copy. FNV-1a over
+// the file size, the first head_size bytes (GGUF header + metadata + tensor infos) and RPC_FILE_ID_N_BLOCKS
+// blocks of RPC_FILE_ID_BLOCK_SIZE bytes at offsets spread evenly over the file, derived only from its size.
+// Reads head_size + 4 MiB at most; a difference outside the hashed ranges is not detected.
+static constexpr uint64_t RPC_FILE_ID_BLOCK_SIZE = 64*1024;
+static constexpr uint64_t RPC_FILE_ID_N_BLOCKS   = 64;
+static constexpr uint64_t RPC_FILE_ID_MAX_HEAD   = 256*1024*1024;
+
+static bool rpc_file_digest(std::istream & f, uint64_t file_size, uint64_t head_size, uint64_t & digest) {
+    if (head_size > file_size || head_size > RPC_FILE_ID_MAX_HEAD) {
+        return false;
+    }
+    uint64_t hash = fnv_hash((const uint8_t *) &file_size, sizeof(file_size));
+    hash = fnv_hash((const uint8_t *) &head_size, sizeof(head_size), hash);
+    std::vector<uint8_t> buf(RPC_FILE_ID_BLOCK_SIZE);
+    auto hash_range = [&](uint64_t offset, uint64_t size) {
+        f.clear();
+        f.seekg((std::streamoff) offset, std::ios::beg);
+        while (size > 0) {
+            const size_t n = (size_t) std::min<uint64_t>(size, buf.size());
+            if (!f.read((char *) buf.data(), (std::streamsize) n)) {
+                return false;
+            }
+            hash = fnv_hash(buf.data(), n, hash);
+            size -= n;
+        }
+        return true;
+    };
+    if (!hash_range(0, head_size)) {
+        return false;
+    }
+    const uint64_t block = std::min(file_size, RPC_FILE_ID_BLOCK_SIZE);
+    for (uint64_t i = 0; i < RPC_FILE_ID_N_BLOCKS; i++) {
+        if (!hash_range((file_size - block) * i / (RPC_FILE_ID_N_BLOCKS - 1), block)) {
+            return false;
+        }
+    }
+    digest = hash;
+    return true;
 }
 
 static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
@@ -541,6 +602,11 @@ public:
 
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, const void * payload, size_t payload_size, void * output, size_t output_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output = nullptr, size_t output_size = 0);
+    // fork extension: like send() without payload, but aborts with a clear error when the server has not answered
+    // `timeout` after the command went out (time queued behind other commands does not count). There is no
+    // fallback: the connection is out of sync once a response is missing, so the load cannot continue
+    void send_timeout(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size,
+                      std::chrono::seconds timeout);
 
     ggml_backend_event_t event_new(ggml_backend_dev_t dev);
     void event_free(ggml_backend_event_t event);
@@ -559,6 +625,11 @@ public:
 
     // set after the first refused SET_TENSOR_FILE, so the remaining tensors go straight to the normal upload
     std::atomic_bool set_tensor_file_disabled{false};
+    // FILE_IDENTITY verdict per client file path (true = the server's copy matches), see rpc_file_identity_ok
+    std::mutex file_identity_mutex;
+    std::unordered_map<std::string, bool> file_identity;
+
+    std::string endpoint;
 
     ~rpc_dispatcher();
 
@@ -572,6 +643,7 @@ private:
         const void                  * payload      = nullptr;
         size_t                        payload_size = 0;
         std::promise<void>            completion;
+        std::atomic<int64_t>          sent_at_ns{0}; // steady_clock time the command went out, 0 while queued
     };
     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
     using rpc_msg_queue = message_queue<rpc_msg_ptr>;
@@ -611,6 +683,27 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
     future.wait();
+}
+
+void rpc_dispatcher::send_timeout(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size,
+                                  std::chrono::seconds timeout) {
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = cmd;
+    msg->input = std::move(input);
+    msg->input_size = input_size;
+    msg->output = output;
+    msg->output_size = output_size;
+    GGML_ASSERT(queue.push(msg));
+    auto future = msg->completion.get_future();
+    while (future.wait_for(std::chrono::milliseconds(250)) != std::future_status::ready) {
+        const int64_t sent_at_ns = msg->sent_at_ns.load();
+        const int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch() / std::chrono::nanoseconds(1);
+        if (sent_at_ns != 0 && now_ns - sent_at_ns > std::chrono::nanoseconds(timeout).count()) {
+            GGML_ABORT("RPC server %s did not answer %s within %lld s (stalled read of its model file?), aborting the load; "
+                       "raise GGML_RPC_FILE_LOAD_TIMEOUT or start the client with LLAMA_RPC_FILE_LOAD=0",
+                       endpoint.c_str(), rpc_cmd_name(cmd), (long long) timeout.count());
+        }
+    }
 }
 
 void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
@@ -692,6 +785,7 @@ bool rpc_dispatcher::start(const std::string & endpoint) {
         return false;
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+    this->endpoint = endpoint;
     running = true;
     thread = std::thread(rpc_dispatcher_trampoline, this);
     return true;
@@ -717,6 +811,7 @@ void rpc_dispatcher::work() {
                      rpc_log_format_size(msg_ptr->input_size).c_str(), rpc_log_format_size(msg_ptr->output_size).c_str());
             const bool trace = rpc_log_debug_level() >= 3;
             const auto t0 = std::chrono::steady_clock::now();
+            msg_ptr->sent_at_ns = t0.time_since_epoch() / std::chrono::nanoseconds(1);
             if (msg_ptr->output) {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
                 RPC_STATUS_ASSERT(status);
@@ -1027,10 +1122,80 @@ static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t
     return buft_ctx->name.c_str();
 }
 
+// fork extension: time the server gets to answer FILE_IDENTITY / SET_TENSOR_FILE of `size` bytes before the
+// client gives up: GGML_RPC_FILE_LOAD_TIMEOUT seconds (default 60) plus 1 s per 8 MiB to read
+static std::chrono::seconds rpc_file_load_timeout(uint64_t size) {
+    static const long long base = [] {
+        const char * env = std::getenv("GGML_RPC_FILE_LOAD_TIMEOUT");
+        const long long v = env ? std::atoll(env) : 0;
+        return v > 0 ? v : 60;
+    }();
+    return std::chrono::seconds(base + (long long) (size / (8*1024*1024)));
+}
+
+// request header followed by the path bytes, as FILE_IDENTITY and SET_TENSOR_FILE expect
+template <typename T>
+static std::shared_ptr<uint8_t> rpc_pack_path_msg(const T & hdr, const char * path, size_t path_len, size_t & input_size) {
+    input_size = sizeof(hdr) + path_len;
+    uint8_t * input = new uint8_t[input_size];
+    memcpy(input, &hdr, sizeof(hdr));
+    memcpy(input + sizeof(hdr), path, path_len);
+    return std::shared_ptr<uint8_t>(input, std::default_delete<uint8_t[]>());
+}
+
+// fork extension: before the server loads anything from its own copy of `path`, compare size + rpc_file_digest
+// of both copies (FILE_IDENTITY). The verdict is cached per server and path; on a mismatch the tensors of
+// that file are sent over the socket as usual.
+static bool rpc_file_identity_ok(rpc_dispatcher & dispatcher, const char * path, size_t path_len, uint64_t file_size) {
+    std::lock_guard<std::mutex> lock(dispatcher.file_identity_mutex);
+    auto it = dispatcher.file_identity.find(path);
+    if (it != dispatcher.file_identity.end()) {
+        return it->second;
+    }
+    bool ok = false;
+    rpc_msg_file_identity_req hdr = {};
+    hdr.file_size = file_size;
+    hdr.path_len  = (uint32_t) path_len;
+    {
+        gguf_init_params params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+        gguf_context * gctx = gguf_init_from_file(path, params);
+        if (gctx) {
+            hdr.head_size = gguf_get_data_offset(gctx);
+            gguf_free(gctx);
+        }
+    }
+    std::ifstream f(path, std::ios::binary);
+    uint64_t digest = 0;
+    if (hdr.head_size == 0 || !f.is_open() || !rpc_file_digest(f, file_size, hdr.head_size, digest)) {
+        LOG_WARN("[%s] %s: cannot fingerprint local file '%s'; sending its tensor data to this server instead\n",
+                 __func__, dispatcher.endpoint.c_str(), path);
+    } else {
+        hdr.digest = digest;
+        size_t input_size;
+        auto input = rpc_pack_path_msg(hdr, path, path_len, input_size);
+        rpc_msg_file_identity_rsp response = {};
+        dispatcher.send_timeout(RPC_CMD_FILE_IDENTITY, input, input_size, &response, sizeof(response),
+                                rpc_file_load_timeout(hdr.head_size + RPC_FILE_ID_N_BLOCKS*RPC_FILE_ID_BLOCK_SIZE));
+        const uint64_t server_digest = response.digest;
+        ok = response.result && server_digest == digest;
+        if (ok) {
+            LOG_INFO("[%s] %s: its copy of '%s' matches (size %" PRIu64 ", digest %016" PRIx64 "), it loads the tensor data itself\n",
+                     __func__, dispatcher.endpoint.c_str(), path, file_size, digest);
+        } else {
+            LOG_WARN("[%s] %s: its copy of '%s' is missing, refused or different (digest %016" PRIx64 " here, %016" PRIx64 " there, "
+                     "0 = not found/refused, see the rpc-server log); sending the tensor data instead\n",
+                     __func__, dispatcher.endpoint.c_str(), path, digest, server_digest);
+        }
+    }
+    dispatcher.file_identity[path] = ok;
+    return ok;
+}
+
 // fork extension: ask the server owning tensor->buffer to fill [offset, offset + size) of the tensor from
 // [file_offset, file_offset + size) of its own copy of `path`, instead of sending the bytes.
 // Returns false (and nothing is written) when the buffer is not an RPC buffer, the server did not
-// advertise the capability, or the server refused/failed; the caller must then upload the data itself.
+// advertise the capability, its copy of the file is not identical (rpc_file_identity_ok) or the server
+// refused/failed; the caller must then upload the data itself.
 bool ggml_backend_rpc_buffer_set_tensor_from_file(ggml_tensor * tensor, const char * path, uint64_t file_offset,
                                                   uint64_t file_size, size_t offset, size_t size) {
     if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_rpc(tensor->buffer) ||
@@ -1043,7 +1208,7 @@ bool ggml_backend_rpc_buffer_set_tensor_from_file(ggml_tensor * tensor, const ch
         return false;
     }
     const size_t path_len = strlen(path);
-    if (path_len > 4096) {
+    if (path_len > 4096 || !rpc_file_identity_ok(dispatcher, path, path_len, file_size)) {
         return false;
     }
     rpc_msg_set_tensor_file_req hdr = {};
@@ -1053,14 +1218,11 @@ bool ggml_backend_rpc_buffer_set_tensor_from_file(ggml_tensor * tensor, const ch
     hdr.file_offset = file_offset;
     hdr.file_size   = file_size;
     hdr.path_len    = (uint32_t) path_len;
-    const size_t input_size = sizeof(hdr) + path_len;
-    uint8_t * input = new uint8_t[input_size];
-    memcpy(input, &hdr, sizeof(hdr));
-    memcpy(input + sizeof(hdr), path, path_len);
-    std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+    size_t input_size;
+    auto input_ptr = rpc_pack_path_msg(hdr, path, path_len, input_size);
 
     rpc_msg_set_tensor_file_rsp response = {};
-    dispatcher.send(RPC_CMD_SET_TENSOR_FILE, input_ptr, input_size, nullptr, 0, &response, sizeof(response));
+    dispatcher.send_timeout(RPC_CMD_SET_TENSOR_FILE, input_ptr, input_size, &response, sizeof(response), rpc_file_load_timeout(size));
     LOG_DBG2("[%s] tensor: %s, file: %s @ %" PRIu64 ", size: %s -> %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),
              path, file_offset, rpc_log_format_size(size).c_str(), response.result ? "ok" : "refused");
     if (!response.result) {
@@ -1528,6 +1690,8 @@ public:
     bool set_tensor_2d(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool set_tensor_file(const std::vector<uint8_t> & input, rpc_msg_set_tensor_file_rsp & response);
+    bool file_identity(const std::vector<uint8_t> & input, rpc_msg_file_identity_rsp & response);
+    void file_load_log(bool done);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -1584,8 +1748,17 @@ private:
     const char * cache_dir;
     // canonical allow-listed directory for SET_TENSOR_FILE; empty = feature disabled
     fs::path model_dir;
-    // files opened by SET_TENSOR_FILE, keyed by the canonical path, kept open for the connection
+    // files that passed FILE_IDENTITY, keyed by the canonical path, kept open for the connection;
+    // SET_TENSOR_FILE only reads from these, through the same stream the identity was computed on
     std::unordered_map<std::string, std::unique_ptr<std::ifstream>> tensor_files;
+    // bytes loaded by SET_TENSOR_FILE since the last "file_load done" line (file_load_log)
+    struct file_load_stats {
+        uint64_t bytes        = 0;
+        uint64_t tensors      = 0;
+        uint64_t bytes_logged = 0;
+        std::chrono::steady_clock::time_point t_start;
+        std::chrono::steady_clock::time_point t_logged;
+    } file_load;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // computed graphs cached per backend, keyed by uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
@@ -2065,18 +2238,27 @@ static bool rpc_path_is_within(const fs::path & dir, const fs::path & p) {
     return true;
 }
 
-// Resolve a client-supplied path to a canonical regular file inside model_dir.
-// Tried in order: the path as given (relative paths are taken relative to model_dir), then
-// model_dir/<file name>, which covers a client that mounts the same export somewhere else.
-// Symlinks are resolved before the containment check, so a link pointing outside is refused.
+// Resolve a client-supplied path to a canonical regular file inside model_dir. The path only names the file,
+// it is never opened as given: its trailing components are looked up below model_dir, longest first
+// (/a/b/x.gguf -> DIR/a/b/x.gguf, DIR/b/x.gguf, DIR/x.gguf), which covers a client that mounts the same export
+// somewhere else. A path that is empty, contains a NUL byte or an empty, "." or ".." component is refused as a
+// whole. Symlinks are resolved before the containment check, so a link pointing outside model_dir is refused.
 static bool rpc_resolve_model_file(const fs::path & model_dir, const std::string & req, fs::path & out) {
-    const fs::path req_path(req);
-    std::vector<fs::path> candidates;
-    candidates.push_back(req_path.is_absolute() ? req_path : model_dir / req_path);
-    if (req_path.has_filename()) {
-        candidates.push_back(model_dir / req_path.filename());
+    if (req.empty() || req.find('\0') != std::string::npos) {
+        return false;
     }
-    for (const auto & cand : candidates) {
+    std::vector<fs::path> parts;
+    for (const auto & part : fs::path(req).relative_path()) {
+        if (part.empty() || part == "." || part == "..") {
+            return false;
+        }
+        parts.push_back(part);
+    }
+    for (size_t first = 0; first < parts.size(); first++) {
+        fs::path cand = model_dir;
+        for (size_t i = first; i < parts.size(); i++) {
+            cand /= parts[i];
+        }
         std::error_code ec;
         fs::path c = fs::canonical(cand, ec);
         if (ec || !rpc_path_is_within(model_dir, c) || !fs::is_regular_file(c, ec) || ec) {
@@ -2088,19 +2270,93 @@ static bool rpc_resolve_model_file(const fs::path & model_dir, const std::string
     return false;
 }
 
+// FILE_IDENTITY / SET_TENSOR_FILE request: header T followed by path_len bytes of path; false if malformed
+template <typename T>
+static bool rpc_parse_path_msg(const std::vector<uint8_t> & input, T & request, std::string & path) {
+    if (input.size() < sizeof(T)) {
+        return false;
+    }
+    memcpy(&request, input.data(), sizeof(T));
+    if (request.path_len > 4096 || input.size() != sizeof(T) + request.path_len) {
+        return false;
+    }
+    path.assign((const char *) input.data() + sizeof(T), request.path_len);
+    return true;
+}
+
+bool rpc_server::file_identity(const std::vector<uint8_t> & input, rpc_msg_file_identity_rsp & response) {
+    // malformed messages close the connection (return false), refusals only answer result = 0
+    response = {};
+    rpc_msg_file_identity_req request;
+    std::string req_path;
+    if (!rpc_parse_path_msg(input, request, req_path)) {
+        return false;
+    }
+    if (model_dir.empty()) {
+        LOG_ERROR("[%s] refused '%s': rpc-server was started without --model-dir\n", __func__, req_path.c_str());
+        return true;
+    }
+    fs::path file_path;
+    if (!rpc_resolve_model_file(model_dir, req_path, file_path)) {
+        LOG_ERROR("[%s] refused '%s': not an existing regular file inside --model-dir '%s'\n",
+                  __func__, req_path.c_str(), model_dir.string().c_str());
+        return true;
+    }
+    const std::string key = file_path.string();
+    std::error_code ec;
+    const uint64_t file_size = fs::file_size(file_path, ec);
+    if (ec || file_size != request.file_size) {
+        LOG_ERROR("[%s] refused '%s': local file size %" PRIu64 " != client file size %" PRIu64 " (different file?)\n",
+                  __func__, key.c_str(), ec ? 0 : file_size, (uint64_t) request.file_size);
+        return true;
+    }
+    auto ifs = std::make_unique<std::ifstream>(file_path, std::ios::binary);
+    uint64_t digest = 0;
+    if (!ifs->is_open() || !rpc_file_digest(*ifs, file_size, request.head_size, digest)) {
+        LOG_ERROR("[%s] refused '%s': read failed or bad head size %" PRIu64 "\n", __func__, key.c_str(), (uint64_t) request.head_size);
+        return true;
+    }
+    response.digest = digest;
+    if (digest != request.digest) {
+        LOG_ERROR("[%s] refused '%s': same size but different content (digest %016" PRIx64 " here, %016" PRIx64 " on the client)\n",
+                  __func__, key.c_str(), digest, (uint64_t) request.digest);
+        tensor_files.erase(key);
+        return true;
+    }
+    LOG_INFO("[%s] loading tensor data from local file '%s' (client path '%s', digest %016" PRIx64 ")\n",
+             __func__, key.c_str(), req_path.c_str(), digest);
+    tensor_files[key] = std::move(ifs);
+    response.result = 1;
+    return true;
+}
+
+// "[file_load] progress|done bytes=N tensors=N elapsed_ms=N" lines for log scrapers: progress at most every 256 MiB
+// or 1 s while SET_TENSOR_FILE reads, done on the first graph computation after loading or when the client disconnects
+void rpc_server::file_load_log(bool done) {
+    if (file_load.bytes == 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!done && file_load.bytes - file_load.bytes_logged < 256*1024*1024 && now - file_load.t_logged < std::chrono::seconds(1)) {
+        return;
+    }
+    const long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - file_load.t_start).count();
+    LOG_INFO("[file_load] %s bytes=%" PRIu64 " tensors=%" PRIu64 " elapsed_ms=%lld\n",
+             done ? "done" : "progress", file_load.bytes, file_load.tensors, elapsed_ms);
+    if (done) {
+        file_load = file_load_stats();
+    } else {
+        file_load.bytes_logged = file_load.bytes;
+        file_load.t_logged     = now;
+    }
+}
+
 bool rpc_server::set_tensor_file(const std::vector<uint8_t> & input, rpc_msg_set_tensor_file_rsp & response) {
     // malformed messages close the connection (return false), refusals only answer result = 0
     response.result = 0;
-    if (input.size() < sizeof(rpc_msg_set_tensor_file_req)) {
-        return false;
-    }
     rpc_msg_set_tensor_file_req request;
-    memcpy(&request, input.data(), sizeof(request));
-    if (request.path_len == 0 || request.path_len > 4096 || input.size() != sizeof(request) + request.path_len) {
-        return false;
-    }
-    const std::string req_path((const char *) input.data() + sizeof(request), request.path_len);
-    if (req_path.find('\0') != std::string::npos) {
+    std::string req_path;
+    if (!rpc_parse_path_msg(input, request, req_path)) {
         return false;
     }
 
@@ -2159,13 +2415,8 @@ bool rpc_server::set_tensor_file(const std::vector<uint8_t> & input, rpc_msg_set
     const std::string key = file_path.string();
     auto it = tensor_files.find(key);
     if (it == tensor_files.end()) {
-        auto ifs = std::make_unique<std::ifstream>(file_path, std::ios::binary);
-        if (!ifs->is_open()) {
-            LOG_ERROR("[%s] refused '%s': open failed\n", __func__, key.c_str());
-            return true;
-        }
-        LOG_INFO("[%s] loading tensor data from local file '%s' (client path '%s')\n", __func__, key.c_str(), req_path.c_str());
-        it = tensor_files.emplace(key, std::move(ifs)).first;
+        LOG_ERROR("[%s] refused '%s': not verified with FILE_IDENTITY on this connection\n", __func__, key.c_str());
+        return true;
     }
     std::ifstream & ifs = *it->second;
 
@@ -2173,6 +2424,9 @@ bool rpc_server::set_tensor_file(const std::vector<uint8_t> & input, rpc_msg_set
              rpc_log_format_tensor(tensor).c_str(), request.offset, rpc_log_format_size(request.size).c_str(),
              key.c_str(), request.file_offset);
 
+    if (file_load.bytes == 0) {
+        file_load.t_start = file_load.t_logged = std::chrono::steady_clock::now();
+    }
     const bool is_host = ggml_backend_buffer_is_host(tensor->buffer);
     const size_t chunk_size = 16*1024*1024;
     if (!is_host && set_tensor_buf.size() < std::min<uint64_t>(request.size, chunk_size)) {
@@ -2196,7 +2450,10 @@ bool rpc_server::set_tensor_file(const std::vector<uint8_t> & input, rpc_msg_set
             ggml_backend_tensor_set(tensor, dst, request.offset + done, n);
         }
         done += n;
+        file_load.bytes += n;
+        file_load_log(false);
     }
+    file_load.tensors++;
     response.result = 1;
     return true;
 }
@@ -2423,6 +2680,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+    file_load_log(true);
     // serialization format:
     // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t)) {
@@ -2885,6 +3143,7 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    file_load_log(true);
     // Wait for outstanding work. Destroying a communicator while its kernels are still running
     // is unsafe.
     sync_all_backends();
@@ -3119,6 +3378,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 rpc_msg_set_tensor_file_rsp response;
                 if (!server.set_tensor_file(input, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_FILE_IDENTITY: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                rpc_msg_file_identity_rsp response;
+                if (!server.file_identity(input, response)) {
                     return;
                 }
                 if (!send_msg(sock, &response, sizeof(response))) {

@@ -41,8 +41,10 @@ GGML_BACKEND_API void ggml_backend_rpc_start_server_ext(
         size_t n_devices,
         ggml_backend_dev_t * devices);
 
-// fork extension: let the RPC server owning tensor->buffer read the bytes from its own copy of `path`.
-// Returns false without writing anything usable if unsupported/refused; the caller must then upload the data itself.
+// fork extension: let the RPC server owning tensor->buffer read the bytes from its own copy of `path`, once that copy
+// was found identical to `path` (size + header/metadata + sampled blocks, checked on the first call per server and path).
+// Returns false without writing anything usable if unsupported/refused/different; the caller must then upload the data itself.
+// Aborts if the server does not answer within GGML_RPC_FILE_LOAD_TIMEOUT (default 60) s + 1 s per 8 MiB.
 GGML_BACKEND_API bool ggml_backend_rpc_buffer_set_tensor_from_file(struct ggml_tensor * tensor, const char * path,
         uint64_t file_offset, uint64_t file_size, size_t offset, size_t size);
 

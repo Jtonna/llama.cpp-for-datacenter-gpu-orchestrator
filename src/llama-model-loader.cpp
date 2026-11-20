@@ -1892,7 +1892,7 @@ bool llama_model_loader::load_all_data(
 
         // RPC servers started with --model-dir read their share straight from their own copy of the
         // file, so this process neither reads nor sends those bytes. Falls back to the normal upload
-        // below when the server refuses (missing file, size mismatch, path outside its model dir).
+        // below when the server refuses (missing or different file, path outside its model dir).
         if (rpc_set_tensor_file && cur->buffer && cur->data && !lazy.has(cur) && !check_tensors &&
                 weight->idx < file_paths.size() && !file_paths[weight->idx].empty()) {
             const auto & file = files.at(weight->idx);
