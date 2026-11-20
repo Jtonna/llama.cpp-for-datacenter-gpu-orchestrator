@@ -277,8 +277,10 @@ struct llama_model_loader {
     };
     std::unordered_map<ggml_backend_buffer_t, mmap_async_ctx> mmap_async_by_buf;
     // Guards cross-thread state when load_all_data runs on sibling threads: the async
-    // map above, size_done, the progress_callback invocation, mmaps_used entries,
-    // lmlocks->at(idx)->grow_to writes, and the final-cleanup gate.
+    // map above (every insert and every lookup while load_all_data threads may run;
+    // finalize_async_uploads() runs after they joined), size_done, the progress_callback
+    // invocation, mmaps_used entries, lmlocks->at(idx)->grow_to writes, and the
+    // final-cleanup gate.
     std::mutex load_mutex;
     // Serialises positioned reads (seek + read) on the llama_file handles. Without mmap every load_all_data
     // thread reads through the same handle, whose file position is shared: a seek by one thread between another

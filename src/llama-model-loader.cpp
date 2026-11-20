@@ -1883,9 +1883,19 @@ bool llama_model_loader::load_all_data(
             } else {
                 // mmap pointers are stable for the lifetime of the mapping, so fire-and-forget
                 // via the tensor's own buffer backend when it supports async set_tensor.
-                auto it = mmap_async_by_buf.find(cur->buffer);
-                if (it != mmap_async_by_buf.end() && it->second.backend) {
-                    ggml_backend_tensor_set_async(it->second.backend, cur, data, 0, n_size);
+                // Sibling load_all_data threads insert into mmap_async_by_buf (setup above) while this thread is
+                // loading, so the lookup is done under load_mutex and only the backend pointer is copied out; the
+                // entry is not erased or freed before finalize_async_uploads(), which runs after all threads joined.
+                ggml_backend_t async_backend = nullptr;
+                {
+                    std::lock_guard<std::mutex> lk(load_mutex);
+                    auto it = mmap_async_by_buf.find(cur->buffer);
+                    if (it != mmap_async_by_buf.end()) {
+                        async_backend = it->second.backend;
+                    }
+                }
+                if (async_backend) {
+                    ggml_backend_tensor_set_async(async_backend, cur, data, 0, n_size);
                 } else {
                     ggml_backend_tensor_set(cur, data, 0, n_size);
                 }
