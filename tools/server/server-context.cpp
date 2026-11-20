@@ -1196,11 +1196,11 @@ private:
         auto * d = static_cast<load_progress_data *>(user_data);
         GGML_ASSERT(d);
         // plain INFO line for log readers (the callback otherwise replaces llama.cpp's dots and prints nothing):
-        // at most once per second, final 1.00 exactly once. Independent of the state callback and return value.
+        // at most every 250 ms, final 1.00 exactly once. Independent of the state callback and return value.
         {
             const int64_t t_now = ggml_time_ms();
             const bool done = progress >= 1.0f;
-            if (done ? !d->logged_final : (d->t_last_log_ms == 0 || t_now - d->t_last_log_ms >= 1000)) {
+            if (done ? !d->logged_final : (d->t_last_log_ms == 0 || t_now - d->t_last_log_ms >= 250)) {
                 d->t_last_log_ms = t_now;
                 d->logged_final  = d->logged_final || done;
                 // not SRV_INF: its fixed 12-char name field would truncate "load_progress"

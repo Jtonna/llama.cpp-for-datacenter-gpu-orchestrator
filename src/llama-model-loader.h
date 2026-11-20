@@ -303,9 +303,35 @@ struct llama_model_loader {
     rpc_set_tensor_file_t rpc_set_tensor_file = nullptr;
     size_t rpc_file_tensors = 0; // guarded by load_mutex
     size_t rpc_file_bytes   = 0; // guarded by load_mutex
+    // LLAMA_RPC_FILE_LOAD=required: every tensor placed on an RPC server must be read by that server from its own
+    // copy of the file; anything that would upload tensor data over the socket fails the load instead
+    bool rpc_file_load_required = false;
+    const char * (*rpc_buft_endpoint)(ggml_backend_buffer_type_t) = nullptr;
+    // ggml_backend_rpc_buft_prepare_file_load: returns enum ggml_rpc_file_load_status (0 ok, 1 no_capability, 2 refused, 3 identity_mismatch)
+    using rpc_prepare_file_load_t = int (*)(ggml_backend_buffer_type_t buft, const char * path, uint64_t file_size,
+                                            uint64_t n_tensors, uint64_t n_bytes);
+    rpc_prepare_file_load_t rpc_prepare_file_load = nullptr;
+    // what each capable RPC server will be asked to read from each file (filled by init_rpc_file_load)
+    struct rpc_file_plan {
+        ggml_backend_buffer_type_t buft; // one of the server's buffer types (all of them share its connection)
+        std::string endpoint;
+        uint16_t    idx;                 // file index
+        uint64_t    n_tensors;
+        uint64_t    n_bytes;
+    };
+    std::vector<rpc_file_plan> rpc_file_plans;
+    // logs the "rpc_file_load_required: endpoint=... file=... reason=..." line
+    void log_rpc_file_load_required(const char * endpoint, const std::string & file, const char * reason) const;
     // call after the tensors were created (ctx_map is filled); returns true if any context is served by
-    // such a server, in which case the caller should not prefetch the whole mapping. LLAMA_RPC_FILE_LOAD=0 disables it.
+    // such a server, in which case the caller should not prefetch the whole mapping. Records what each server will
+    // be asked to read (rpc_file_plans). LLAMA_RPC_FILE_LOAD=0 disables it; =required throws (before any buffer is
+    // allocated) if a server the model offloads to does not advertise the capability.
     bool init_rpc_file_load();
+    // call after the backend buffers were allocated and before load_all_data: verifies each capable server's copy of
+    // each file (FILE_IDENTITY) and announces the tensors / bytes it will be asked to read from it. It must run on the
+    // buffers' connection (an RPC connection nobody holds is closed), hence not in init_rpc_file_load.
+    // =required throws (before any tensor data is sent) if a server refuses or its copy differs.
+    void prepare_rpc_file_load();
 
     std::string ftype_name() const;
 

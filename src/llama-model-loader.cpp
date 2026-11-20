@@ -1532,24 +1532,137 @@ bool llama_model_loader::init_rpc_file_load() {
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buft_supports_set_tensor_file");
     auto set_fn = (rpc_set_tensor_file_t)
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buffer_set_tensor_from_file");
-    if (supports_fn == nullptr || set_fn == nullptr) {
+    auto endpoint_fn = (const char * (*)(ggml_backend_buffer_type_t))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buft_endpoint");
+    auto prepare_fn = (rpc_prepare_file_load_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buft_prepare_file_load");
+    if (supports_fn == nullptr || set_fn == nullptr || endpoint_fn == nullptr || prepare_fn == nullptr) {
         return false;
     }
-    bool any = false;
+    rpc_buft_endpoint = endpoint_fn;
+    rpc_file_load_required = env != nullptr && std::strcmp(env, "required") == 0;
+
+    // What each RPC server will be asked to read, per file: the tensors load_all_data will hand to
+    // rpc_set_tensor_file, i.e. every tensor with a weight in a context whose buffer type is that server's
+    // (lazy tensors live in host contexts, so they never appear here). Several buffer types (devices) can
+    // share one server and one connection, so the totals are summed per endpoint.
+    std::map<std::string, size_t> plan_idx; // endpoint + file index -> rpc_file_plans entry
+    std::map<std::string, bool> capable;
+    rpc_file_plans.clear();
     for (const auto & [ctx_key, ctx_ptr] : ctx_map) {
         if (!ctx_ptr || ggml_get_first_tensor(ctx_ptr.get()) == nullptr) {
+            continue;
+        }
+        const char * endpoint = endpoint_fn(ctx_key.buft);
+        if (endpoint == nullptr) {
             continue;
         }
         if (supports_fn(ctx_key.buft)) {
             LLAMA_LOG_INFO("%s: %s can read its tensor data from its own copy of the model file\n",
                 __func__, ggml_backend_buft_name(ctx_key.buft));
-            any = true;
+            capable[endpoint] = true;
+        } else {
+            capable.emplace(endpoint, false);
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx_ptr.get()); t != nullptr; t = ggml_get_next_tensor(ctx_ptr.get(), t)) {
+            const auto * w = get_weight(ggml_get_name(t));
+            if (w == nullptr || lazy.has(t)) {
+                continue;
+            }
+            const std::string key = std::string(endpoint) + "\n" + std::to_string(w->idx);
+            auto it = plan_idx.find(key);
+            if (it == plan_idx.end()) {
+                it = plan_idx.emplace(key, rpc_file_plans.size()).first;
+                rpc_file_plans.push_back({ ctx_key.buft, endpoint, w->idx, 0, 0 });
+            }
+            rpc_file_plans[it->second].n_tensors++;
+            rpc_file_plans[it->second].n_bytes += ggml_nbytes(t);
         }
     }
+
+    bool any = false;
+    for (const auto & [endpoint, ok] : capable) {
+        any = any || ok;
+    }
+    if (rpc_file_load_required) {
+        // fail before any buffer is allocated if a server cannot do it at all
+        int n_failed = 0;
+        for (const auto & p : rpc_file_plans) {
+            const std::string path = p.idx < file_paths.size() ? file_paths[p.idx] : std::string();
+            if (!capable[p.endpoint]) {
+                log_rpc_file_load_required(p.endpoint.c_str(), path, "no_capability");
+                n_failed++;
+            } else if (check_tensors) {
+                throw std::runtime_error("LLAMA_RPC_FILE_LOAD=required cannot be combined with --check-tensors "
+                                         "(checked tensors are always read and uploaded by this process)");
+            } else if (path.empty()) {
+                throw std::runtime_error("LLAMA_RPC_FILE_LOAD=required needs a model loaded from a file path");
+            }
+        }
+        if (n_failed > 0) {
+            throw std::runtime_error(format("LLAMA_RPC_FILE_LOAD=required: direct file load is not possible for %d RPC server/file "
+                                            "pair(s), see the rpc_file_load_required lines; no tensor data was uploaded", n_failed));
+        }
+    }
+    // only servers that can do it are verified in prepare_rpc_file_load
+    rpc_file_plans.erase(std::remove_if(rpc_file_plans.begin(), rpc_file_plans.end(),
+        [&](const rpc_file_plan & p) { return !capable[p.endpoint]; }), rpc_file_plans.end());
     if (any) {
-        rpc_set_tensor_file = set_fn;
+        rpc_set_tensor_file   = set_fn;
+        rpc_prepare_file_load = prepare_fn;
     }
     return any;
+}
+
+void llama_model_loader::prepare_rpc_file_load() {
+    if (rpc_set_tensor_file == nullptr || rpc_prepare_file_load == nullptr || check_tensors) {
+        return; // with --check-tensors load_all_data uploads every tensor itself (as before)
+    }
+    static const char * status_name[] = { "ok", "no_capability", "refused", "identity_mismatch" };
+    int n_failed = 0;
+    for (const auto & p : rpc_file_plans) {
+        const std::string path = p.idx < file_paths.size() ? file_paths[p.idx] : std::string();
+        if (path.empty()) {
+            continue;
+        }
+        int status = rpc_prepare_file_load(p.buft, path.c_str(), files.at(p.idx)->size(), p.n_tensors, p.n_bytes);
+        if (status < 0 || status > 3) {
+            status = 2;
+        }
+        if (status == 0) {
+            continue;
+        }
+        if (rpc_file_load_required) {
+            log_rpc_file_load_required(p.endpoint.c_str(), path, status_name[status]);
+            n_failed++;
+        } else {
+            LLAMA_LOG_WARN("%s: %s: reason=%s, uploading the %" PRIu64 " tensors (%.2f MiB) of '%s' for this server over the socket instead\n",
+                __func__, p.endpoint.c_str(), status_name[status], p.n_tensors, p.n_bytes / 1024.0 / 1024.0, path.c_str());
+        }
+    }
+    if (n_failed > 0) {
+        throw std::runtime_error(format("LLAMA_RPC_FILE_LOAD=required: direct file load is not possible for %d RPC server/file "
+                                        "pair(s), see the rpc_file_load_required lines; no tensor data was uploaded", n_failed));
+    }
+}
+
+void llama_model_loader::log_rpc_file_load_required(const char * endpoint, const std::string & file, const char * reason) const {
+    const char * why = "";
+    if (std::strcmp(reason, "no_capability") == 0) {
+        why = "the RPC server does not offer direct file load (stock or older rpc-server, or started without --model-dir)";
+    } else if (std::strcmp(reason, "refused") == 0) {
+        why = "the RPC server refused to read this file from its own copy (not found inside its --model-dir, unreadable "
+              "or a read failed; see the rpc-server log)";
+    } else if (std::strcmp(reason, "identity_mismatch") == 0) {
+        why = "the RPC server's copy of this file is not identical to this one (different size or sampled content)";
+    }
+    // The log callback of llama-server / llama-completion prefixes each entry with a timestamp and level, and writing
+    // to stderr directly races with its writer thread. So the entry is logged normally, but the token line is its
+    // second line: it starts at the beginning of a line whatever prefix the first one gets.
+    LLAMA_LOG_ERROR("%s: direct file load is required but not possible for this RPC server:\n"
+                    "rpc_file_load_required: endpoint=%s file=%s reason=%s -- %s; LLAMA_RPC_FILE_LOAD=required forbids "
+                    "uploading tensor data over the socket, so the model load fails\n",
+                    __func__, endpoint, file.c_str(), reason, why);
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
@@ -1902,6 +2015,19 @@ bool llama_model_loader::load_all_data(
                 rpc_file_tensors++;
                 rpc_file_bytes += n_size;
                 continue;
+            }
+        }
+
+        // LLAMA_RPC_FILE_LOAD=required: init_rpc_file_load verified every server and file up front, so getting here
+        // with a tensor on an RPC server means the server refused or failed this read; fail instead of uploading
+        if (rpc_file_load_required && cur->buffer && rpc_buft_endpoint) {
+            const char * endpoint = rpc_buft_endpoint(ggml_backend_buffer_get_type(cur->buffer));
+            if (endpoint != nullptr) {
+                load_cancelled.store(true, std::memory_order_relaxed); // stop sibling load threads too
+                log_rpc_file_load_required(endpoint, weight->idx < file_paths.size() ? file_paths[weight->idx] : std::string(), "refused");
+                throw std::runtime_error(format("LLAMA_RPC_FILE_LOAD=required: RPC server %s did not load tensor '%s' from its own "
+                                                "copy of the model file, see the line above; it was not uploaded instead",
+                                                endpoint, ggml_get_name(cur)));
             }
         }
 

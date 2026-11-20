@@ -2189,6 +2189,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         });
     }
 
+    // RPC direct file load: verify the servers' copies and announce the load totals, on the buffers' connections
+    ml.prepare_rpc_file_load();
+
     // load tensor data — if more than one (ctx, bufs) pair exists, run each in its
     // own thread so independent RPC endpoints fill their dispatcher queues concurrently
     // instead of serialising on a single loader thread. The mutexes inside
