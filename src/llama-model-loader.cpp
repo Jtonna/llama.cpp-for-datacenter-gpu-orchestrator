@@ -1636,6 +1636,7 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
         GGML_ASSERT(buf != nullptr);
         GGML_ASSERT(w.idx < files.size());
         const auto & file = files.at(w.idx);
+        std::lock_guard<std::mutex> lk(file_mutex);
         file->seek(w.offs + offs, SEEK_SET);
         file->read_raw(buf, size);
     }
@@ -1893,8 +1894,12 @@ bool llama_model_loader::load_all_data(
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
+                {
+                    // the handle (and its position) is shared with the other load_all_data threads
+                    std::lock_guard<std::mutex> lk(file_mutex);
+                    file->seek(weight->offs, SEEK_SET);
+                    file->read_raw(cur->data, n_size);
+                }
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
@@ -1907,7 +1912,6 @@ bool llama_model_loader::load_all_data(
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
                     size_t offset_from_alignment = offset - aligned_offset;
-                    file->seek(aligned_offset, SEEK_SET);
 
                     // Calculate aligned read boundaries
                     size_t read_start = aligned_offset;
@@ -1925,8 +1929,14 @@ bool llama_model_loader::load_all_data(
                         // Wait for previous upload to complete before reusing buffer
                         ggml_backend_event_synchronize(events[buffer_idx]);
 
-                        // Read aligned chunk from file
-                        file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
+                        // Read aligned chunk from file. The handle and its position are shared with the other
+                        // load_all_data threads (which seek between two chunks of this tensor), so every chunk is
+                        // positioned explicitly, and seek + read are one step under file_mutex.
+                        {
+                            std::lock_guard<std::mutex> lk(file_mutex);
+                            file->seek(aligned_offset + bytes_read, SEEK_SET);
+                            file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
+                        }
 
                         // Calculate actual data portion (excluding alignment padding)
                         uintptr_t ptr_data = ptr_dest_aligned;
@@ -1973,8 +1983,12 @@ bool llama_model_loader::load_all_data(
                         }
                     }
                     uint8_t * read_dst = (uint8_t *) GGML_PAD((uintptr_t) ggml_backend_buffer_get_base(read_buf.get()), align);
-                    file->seek(aligned_offset, SEEK_SET);
-                    file->read_raw_unsafe(read_dst, read_size);
+                    {
+                        // the handle (and its position) is shared with the other load_all_data threads
+                        std::lock_guard<std::mutex> lk(file_mutex);
+                        file->seek(aligned_offset, SEEK_SET);
+                        file->read_raw_unsafe(read_dst, read_size);
+                    }
 
                     const uint8_t * data = read_dst + pad;
                     ggml_backend_tensor_set(cur, data, 0, n_size);

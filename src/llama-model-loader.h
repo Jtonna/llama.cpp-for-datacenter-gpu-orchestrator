@@ -280,6 +280,10 @@ struct llama_model_loader {
     // map above, size_done, the progress_callback invocation, mmaps_used entries,
     // lmlocks->at(idx)->grow_to writes, and the final-cleanup gate.
     std::mutex load_mutex;
+    // Serialises positioned reads (seek + read) on the llama_file handles. Without mmap every load_all_data
+    // thread reads through the same handle, whose file position is shared: a seek by one thread between another
+    // thread's seek and its (possibly chunked) reads makes that thread silently read the wrong bytes.
+    mutable std::mutex file_mutex;
     // Set when a thread's progress_callback returns false; peer threads check it between
     // tensors and bail out cooperatively.
     std::atomic<bool> load_cancelled{false};
