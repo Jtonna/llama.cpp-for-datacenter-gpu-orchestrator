@@ -1,6 +1,9 @@
-## About this fork
+# llama.cpp for datacenter-gpu-orchestrator
 
-This is the llama.cpp fork used by [datacenter-gpu-orchestrator](https://github.com/Jtonna/datacenter-gpu-orchestrator) (Potluck), a scheduler that pools mixed machines such as game consoles, laptops and desktops into one GPU cluster that runs large language models with llama.cpp. The fork adds changes to how model data is loaded and distributed to RPC workers.
+> **This is a fork**, not upstream. For general use, issues and pull requests go to [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
+
+
+This fork is used by [datacenter-gpu-orchestrator](https://github.com/Jtonna/datacenter-gpu-orchestrator) (Potluck), a scheduler that pools mixed machines such as game consoles, laptops and desktops into one GPU cluster that runs large language models with llama.cpp. The fork adds changes to how model data is loaded and distributed to RPC workers.
 
 Branches:
 
@@ -8,18 +11,14 @@ Branches:
 - `ps5-loader-fixes`: two thread-safety fixes for that parallel loading: a shared file position on the non-mmap path, and an unlocked map lookup on the mmap path.
 - `ps5-direct-pull`: RPC workers read tensor data from their own mount of the model file instead of receiving it over the network. Includes the loader fixes.
 
-Upstream is [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The fork's changes are confined to the model loader and the RPC backend.
 
 There is an open research question on verifying loaded weights; see issue 1 in this repository's issue tracker.
 
----
-# llama.cpp — Jtonna PS5 datacenter fork
+Upstream is [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The fork's changes are confined to the model loader and the RPC backend; see [FORK_CHANGES.md](FORK_CHANGES.md). Measured on a three-machine split, parallel upload cuts first-load time by about 2.1 to 2.35 times.
 
-> **This is a fork**, not upstream. It carries one additional change on top of upstream HEAD: a parallel RPC tensor-upload patch that pipelines model loading across multiple `rpc-server` backends. Measured on a 3-PS5 split, load times drop **~2.1–2.35×** (Gemma 12B 66 s → ~30 s, Kimi-Dev 72B 253 s → 115 s) with bit-identical inference output across all 16 tested profiles. Patch is small (**+164/-7 LOC across 3 loader files**, `ggml-rpc.cpp` untouched); upstream PR candidate. See [`FORK_CHANGES.md`](./FORK_CHANGES.md) for rationale, patch summary, build instructions, and benchmark results.
->
-> **Current branch: `ps5-parallel-upload-head`** (based on upstream HEAD). The older `ps5-parallel-upload` branch (based on `330f018` with the pre-HEAD protocol) is retained for rollback/forensics only.
->
-> **Upstream** is https://github.com/ggml-org/llama.cpp — go there for issues, PRs, and general use. This fork exists only to serve the [ps5-ai-datacenter-manager](https://github.com/Jtonna/ps5-ai-datacenter-manager) project.
+The older `ps5-parallel-upload` branch (older upstream base, older RPC protocol) is kept for reference only.
+
+---
 
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
