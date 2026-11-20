@@ -1,3 +1,18 @@
+## About this fork
+
+This is the llama.cpp fork used by [datacenter-gpu-orchestrator](https://github.com/Jtonna/datacenter-gpu-orchestrator) (Potluck), a scheduler that pools mixed machines such as game consoles, laptops and desktops into one GPU cluster that runs large language models with llama.cpp. The fork adds changes to how model data is loaded and distributed to RPC workers.
+
+Branches:
+
+- `ps5-parallel-upload-head`: uploads tensor data to several RPC workers in parallel. This is the production base.
+- `ps5-loader-fixes`: two thread-safety fixes for that parallel loading: a shared file position on the non-mmap path, and an unlocked map lookup on the mmap path.
+- `ps5-direct-pull`: RPC workers read tensor data from their own mount of the model file instead of receiving it over the network. Includes the loader fixes.
+
+Upstream is [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The fork's changes are confined to the model loader and the RPC backend.
+
+There is an open research question on verifying loaded weights; see issue 1 in this repository's issue tracker.
+
+---
 # llama.cpp — Jtonna PS5 datacenter fork
 
 > **This is a fork**, not upstream. It carries one additional change on top of upstream HEAD: a parallel RPC tensor-upload patch that pipelines model loading across multiple `rpc-server` backends. Measured on a 3-PS5 split, load times drop **~2.1–2.35×** (Gemma 12B 66 s → ~30 s, Kimi-Dev 72B 253 s → 115 s) with bit-identical inference output across all 16 tested profiles. Patch is small (**+164/-7 LOC across 3 loader files**, `ggml-rpc.cpp` untouched); upstream PR candidate. See [`FORK_CHANGES.md`](./FORK_CHANGES.md) for rationale, patch summary, build instructions, and benchmark results.
