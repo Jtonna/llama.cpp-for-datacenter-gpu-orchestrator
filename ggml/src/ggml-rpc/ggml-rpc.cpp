@@ -699,7 +699,8 @@ void rpc_dispatcher::send_timeout(enum rpc_cmd cmd, std::shared_ptr<const void> 
         const int64_t sent_at_ns = msg->sent_at_ns.load();
         const int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch() / std::chrono::nanoseconds(1);
         if (sent_at_ns != 0 && now_ns - sent_at_ns > std::chrono::nanoseconds(timeout).count()) {
-            GGML_ABORT("RPC server %s did not answer %s within %lld s (stalled read of its model file?), aborting the load; "
+            GGML_ABORT("rpc_file_load_timeout: endpoint=%s command=%s timeout_s=%lld -- the RPC server did not answer within the timeout "
+                       "(stalled read of its model file?), aborting the load; "
                        "raise GGML_RPC_FILE_LOAD_TIMEOUT or start the client with LLAMA_RPC_FILE_LOAD=0",
                        endpoint.c_str(), rpc_cmd_name(cmd), (long long) timeout.count());
         }

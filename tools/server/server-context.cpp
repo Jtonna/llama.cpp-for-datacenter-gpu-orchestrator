@@ -1188,11 +1188,25 @@ private:
         std::string stage;
         std::vector<std::string> stages;
         int64_t t_last_load_progress_ms = 0;
+        int64_t t_last_log_ms = 0;   // rate limit for the INFO log line
+        bool    logged_final = false;
         load_progress_data(server_context_impl * ctx, const std::string & stage) : ctx(ctx), stage(stage) {}
     };
     static bool load_progress_callback(float progress, void * user_data) {
         auto * d = static_cast<load_progress_data *>(user_data);
         GGML_ASSERT(d);
+        // plain INFO line for log readers (the callback otherwise replaces llama.cpp's dots and prints nothing):
+        // at most once per second, final 1.00 exactly once. Independent of the state callback and return value.
+        {
+            const int64_t t_now = ggml_time_ms();
+            const bool done = progress >= 1.0f;
+            if (done ? !d->logged_final : (d->t_last_log_ms == 0 || t_now - d->t_last_log_ms >= 1000)) {
+                d->t_last_log_ms = t_now;
+                d->logged_final  = d->logged_final || done;
+                // not SRV_INF: its fixed 12-char name field would truncate "load_progress"
+                LOG_INF("srv  load_progress: fraction=%.2f\n", done ? 1.0f : progress);
+            }
+        }
         // always emit the first and final sample; throttle the rest to one per 200ms
         {
             auto & t_last = d->t_last_load_progress_ms;
