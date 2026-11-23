@@ -1,3 +1,27 @@
+# llama.cpp for datacenter-gpu-orchestrator
+
+> **This is a fork**, not upstream. For general use, issues and pull requests go to [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
+
+**Why.** When a model is split across several machines, stock llama.cpp has the host read the model file and send each worker its share over the network, one worker after another. Loading a 24B model onto three workers took about 130 s.
+
+**What this fork does about it.**
+
+1. It sends to all workers at the same time. The same load takes about 57 s, 2.3 times faster, and the gain grows with the number of workers.
+2. It lets each worker read its share straight from its own copy of the model file, so the host uploads nothing. A 26.5 GB model loads onto six workers in about 62 s, and loading it again takes about 5 s because each worker still has the file in its cache.
+3. It makes that safe: a worker must show it has the same file as the host (size, header and sampled blocks), can only read inside its model folder, and cannot hang a load forever; in required mode a misconfigured worker fails the load with a named reason instead of silently falling back to the slow path.
+
+With parallel upload, answers at temperature 0 were byte-identical to stock on all 16 tested models and splits, and generation speed was unchanged within noise.
+
+The changes touch seven files (model loader, RPC backend, server load logging) and the RPC protocol version is unchanged (10.0.0), so stock machines still interoperate.
+
+Upstream base: [`0a76757`](https://github.com/ggml-org/llama.cpp/commit/0a76757469ea94ad5f88d14e18cc7370b9931f99). Build from `ps5-direct-pull`, the default branch; the other branches are earlier stages kept for reference.
+
+This is the llama.cpp build used by Potluck, the scheduler in [Jtonna/datacenter-gpu-orchestrator](https://github.com/Jtonna/datacenter-gpu-orchestrator), which pools mixed machines into one GPU cluster; every machine in a load runs programs built from this fork.
+
+Details and all measurements: [FORK_CHANGES.md](FORK_CHANGES.md). Release builds: [docs/potluck-builds.md](docs/potluck-builds.md).
+
+---
+
 # llama.cpp
 
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
