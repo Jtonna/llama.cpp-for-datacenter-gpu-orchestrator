@@ -53,6 +53,20 @@ def rpc_proto(src):
     return ".".join(parts)
 
 
+def parse_version(out):
+    """Build number and short commit from `llama-server --version`.
+
+    This fork prints "version: 1.0.0-dev (build 12539, commit cc81d31a0)";
+    older llama.cpp printed "version: 12539 (cc81d31a0)".
+    """
+    m = re.search(r"\(build\s+(\d+),\s*commit\s+([0-9a-f]{7,40})\)", out)
+    if not m:
+        m = re.search(r"version:\s*(\d+)\s*\(([0-9a-f]{7,40})\)", out)
+    if not m:
+        return None, ""
+    return int(m.group(1)), m.group(2)
+
+
 def add_bytes(tar, name, data, mode, mtime):
     info = tarfile.TarInfo(name)
     info.size = len(data)
@@ -103,10 +117,10 @@ def main():
         info = json.load(open(os.path.join(pdir, "build-info.json"), encoding="utf-8"))
         if info["platform"] != platform:
             sys.exit("%s: build-info.json names %s" % (platform, info["platform"]))
-        short = info.get("build_commit_short") or ""
-        if len(short) < 7 or not a.commit.startswith(short):
-            sys.exit("%s: --version reports commit %r, not %s" % (platform, short, a.commit))
-        build_numbers.add(info["build_number"])
+        number, short = parse_version(info["version_output"])
+        if number is None or len(short) < 7 or not a.commit.startswith(short):
+            sys.exit("%s: --version (%r) does not report commit %s" % (platform, info["version_output"], a.commit))
+        build_numbers.add(number)
 
         files = {}
         sums = []

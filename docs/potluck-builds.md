@@ -32,7 +32,7 @@ The platform folder has the layout Potluck serves from its programs folder
 
 - `llama-server` is the host program, `rpc-server` the worker program. Both come
   from the tagged commit and print it: `llama-server --version` answers
-  `version: <commit count> (<short commit>)`.
+  `version: 1.0.0-dev (build <commit count>, commit <short commit>)`.
 - Each is a single file: llama and ggml are linked statically
   (`BUILD_SHARED_LIBS=OFF`), the binaries are not stripped, and no shared
   library is shipped beside them. They use what the machine provides:
@@ -89,8 +89,8 @@ git tag -a potluck-llama-v0.1.0 -m "Potluck llama v0.1.0" <commit>
 git push origin potluck-llama-v0.1.0
 ```
 
-The workflow builds both platforms (expect about two hours, most of it the
-CUDA build), assembles the assets, creates the release as a draft, downloads
+The workflow builds both platforms in parallel (expect about an hour, most of
+it the CUDA build), assembles the assets, creates the release as a draft, downloads
 the uploaded assets again and verifies them, and only then publishes it. A tag
 is released once; to rebuild, cut a new tag.
 

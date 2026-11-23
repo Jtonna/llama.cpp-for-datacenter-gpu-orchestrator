@@ -69,7 +69,7 @@ CUDA_CUDART="$(pkgver cuda-cudart-dev-13-3)" CUBLAS="$(pkgver libcublas-dev-13-3
 NEEDED_SERVER="$(needed "$dest/llama-server" | tr '\n' ' ')" NEEDED_RPC="$(needed "$dest/rpc-server" | tr '\n' ' ')" \
 GLIBC_SERVER="$(glibc_min "$dest/llama-server")" GLIBC_RPC="$(glibc_min "$dest/rpc-server")" \
 python3 - <<'EOF' >"$dest/build-info.json"
-import json, os, re
+import json, os
 e = os.environ
 def ver(a, b):
     pa = [int(x) for x in a.split('.')]
@@ -88,14 +88,11 @@ if e["PLATFORM"].endswith("-vulkan"):
     toolchain.update({"vulkan_loader_dev": e["VULKAN_LOADER"], "glslc": e["GLSLC"], "spirv_headers": e["SPIRV_HEADERS"]})
 else:
     toolchain.update({"cuda_nvcc": e["NVCC_VERSION"], "cuda_cudart_dev": e["CUDA_CUDART"], "cublas_dev": e["CUBLAS"], "nccl_dev": e["NCCL"]})
-m = re.search(r"version:\s*(\d+)\s*\(([0-9a-f]+)\)", e["VERSION_OUT"])
 print(json.dumps({
     "platform": e["PLATFORM"],
     "cmake_flags": e["FLAGS"].split(),
     "toolchain": toolchain,
     "version_output": e["VERSION_OUT"].strip(),
-    "build_number": int(m.group(1)) if m else None,
-    "build_commit_short": m.group(2) if m else None,
     "needs": {"glibc_min": ver(e["GLIBC_SERVER"], e["GLIBC_RPC"]), "libraries": libs},
 }, indent=2))
 EOF
