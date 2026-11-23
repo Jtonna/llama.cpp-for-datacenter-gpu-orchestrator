@@ -2,18 +2,18 @@
 
 > **This is a fork**, not upstream. For general use, issues and pull requests go to [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
 
-**Why.** When a model is split across several machines, stock llama.cpp has the host read the model file and send each worker its share over the network, one worker after another. Loading a 24B model onto three workers took about 130 s.
+**Why.** When a model is split across several machines, stock llama.cpp has the host read the model file and send each worker its share over the network, one worker after another, on every load (upstream's optional worker cache, `rpc-server -c`, can skip re-sending large tensors, but it stores the model on the worker's disk). Loading a 24B model onto three workers took about 130 s.
 
 **What this fork does about it.**
 
-1. It sends to all workers at the same time. The same load takes about 57 s, 2.3 times faster, and the gain grows with the number of workers.
-2. It lets each worker read its share from its own mount (or copy) of the model file, so the host uploads nothing. With the file on one read-only network share, a 26.5 GB model loads onto six workers in about 62 s, and a reload takes about 5 s from the workers' file cache.
-3. It makes that safe: the worker's file must match the host's (size, header, sampled blocks), reads stay inside its model folder, waits are bounded, and in required mode a misconfigured worker fails the load with a named reason instead of silently falling back to the slow path.
+1. It sends to all workers at the same time. The same load took about 57 s, 2.3 times faster; the gain grew from one to three workers, the most tested.
+2. It lets each worker read its share from its own mount (or copy) of the model file, so the host sends none of the workers' weights. With the file on one read-only network share, a 26.5 GB model loaded onto six workers in about 62 s, and a reload took about 5 s, served from the workers' page cache.
+3. It makes that safe: a worker reads only a file whose size, header and sampled blocks match the host's, only inside its model folder (symlinks resolved), and a worker that stops answering ends the load after a bounded wait; in required mode a misconfigured worker fails the load with a named reason instead of silently falling back to the slow path.
 
-- With parallel upload, answers were byte-identical to stock on all 16 tested profiles; generation speed is unchanged.
-- Seven files change; the RPC protocol version (10.0.0) does not, so stock machines still interoperate.
+- With parallel upload, answers at temperature 0 with a fixed seed were byte-identical to stock on all 16 tested profiles, and generation speed was the same within noise (1-3%).
+- Seven files change; the RPC protocol version (10.0.0) does not, so stock machines still interoperate (except in required mode, which needs workers built from this fork).
 - Used by [Potluck](https://github.com/Jtonna/datacenter-gpu-orchestrator), which pools mixed machines into one GPU cluster; every machine in a load runs programs built from this fork.
-- Upstream base [`0a76757`](https://github.com/ggml-org/llama.cpp/commit/0a76757469ea94ad5f88d14e18cc7370b9931f99). Build from `potluck`, the default branch (called `ps5-direct-pull` until 23 November 2026 (UTC)); the other branches are earlier stages kept for reference.
+- Upstream base [`0a76757`](https://github.com/ggml-org/llama.cpp/commit/0a76757469ea94ad5f88d14e18cc7370b9931f99). Build from `potluck`, the default branch (called `ps5-direct-pull` until 23 November 2026 (UTC)); the other branches are not used for builds.
 
 What changed, why, and the measurements: [CHANGELOG_FOR_POTLUCK.md](CHANGELOG_FOR_POTLUCK.md). Release builds: [docs/potluck-builds.md](docs/potluck-builds.md).
 
