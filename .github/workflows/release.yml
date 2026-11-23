@@ -1,0 +1,186 @@
+# Potluck llama release: builds llama-server and rpc-server for every platform
+# Potluck serves, and publishes them as a GitHub release of the pushed tag.
+# What a release contains and how to cut one: docs/potluck-builds.md.
+#
+# This file replaces upstream llama.cpp's release.yml on this fork: upstream's
+# workflow tags and publishes multi-platform "b<NNNN>" releases on every push to
+# master, which this fork must not do.
+name: Potluck llama release
+
+on:
+  push:
+    tags:
+      - 'potluck-llama-v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: build and assemble only, publish no release (always a dry run unless started on a potluck-llama-v* tag)'
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: potluck-llama-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build ${{ matrix.platform }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-amd64-vulkan, linux-amd64-cuda]
+    steps:
+      - name: Free disk space for the CUDA image
+        if: matrix.platform == 'linux-amd64-cuda'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          sudo docker image prune --all --force >/dev/null
+          df -h /
+
+      - name: Check out with full history, as the build number is the commit count
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build in the pinned container
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          start=$(date +%s)
+          bash .github/potluck/build.sh "$PLATFORM" dist
+          echo "build took $(( ($(date +%s) - start) / 60 )) min"
+          ls -la "dist/$PLATFORM"
+          df -h /
+
+      - name: Keep the build output
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-${{ matrix.platform }}
+          path: dist/${{ matrix.platform }}
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Check out (full history, to find the upstream base)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch the build output
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: build-*
+          path: dist
+
+      - name: Release facts
+        id: meta
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          commit=$(git rev-parse HEAD)
+          if [ "$REF_TYPE" = tag ]; then tag=$REF_NAME; else tag="dryrun-${commit:0:12}"; fi
+          git fetch --no-tags --quiet https://github.com/ggml-org/llama.cpp.git master
+          base=$(git merge-base HEAD FETCH_HEAD)
+          {
+            echo "tag=$tag"
+            echo "commit=$commit"
+            echo "base=$base"
+            echo "epoch=$(git log -1 --format=%ct HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          echo "tag $tag, fork commit $commit, upstream base $base"
+          echo "fork commits on top of upstream:"
+          git log --oneline "$base..HEAD"
+
+      - name: Assemble archives, manifest and SHA256SUMS
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+          BASE: ${{ steps.meta.outputs.base }}
+          EPOCH: ${{ steps.meta.outputs.epoch }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          for p in dist/build-*; do mv "$p" "dist/${p#dist/build-}"; done
+          python3 .github/potluck/assemble.py --dist dist --out release --src . \
+            --tag "$TAG" --commit "$COMMIT" --upstream-base "$BASE" \
+            --repository "$REPO" --source-date-epoch "$EPOCH" --run-url "$RUN_URL"
+          bash .github/potluck/verify.sh release
+          cat release/potluck-llama-manifest.json
+
+      - name: Keep the release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: release
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: assemble
+    if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.dry_run == false)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.assemble.outputs.tag }}
+    steps:
+      - name: Check out (for the verify script)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch the release assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: release
+
+      - name: Create the release as a draft
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "a release for $TAG already exists; a tag is released once" >&2
+            exit 1
+          fi
+          commit=$(jq -r .llama_build release/potluck-llama-manifest.json)
+          {
+            echo "Potluck llama build \`$commit\` (fork commit), upstream base \`$(jq -r .upstream.base_commit release/potluck-llama-manifest.json)\`."
+            echo
+            echo "Platforms: $(jq -r '.platforms | keys | join(", ")' release/potluck-llama-manifest.json)."
+            echo "Verify a download with \`sha256sum -c SHA256SUMS\` (see docs/potluck-builds.md)."
+          } > notes.md
+          gh release create "$TAG" --draft --verify-tag --title "Potluck llama $TAG" --notes-file notes.md release/*
+
+      - name: Download the uploaded assets again and verify them
+        run: |
+          mkdir check
+          gh release download "$TAG" --dir check
+          (cd release && ls) > want.txt
+          (cd check && ls) > got.txt
+          diff want.txt got.txt
+          for f in release/*; do cmp "$f" "check/$(basename "$f")"; done
+          bash .github/potluck/verify.sh check
+
+      - name: Publish the draft
+        run: gh release edit "$TAG" --draft=false
