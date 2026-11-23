@@ -7,18 +7,15 @@
 **What this fork does about it.**
 
 1. It sends to all workers at the same time. The same load takes about 57 s, 2.3 times faster, and the gain grows with the number of workers.
-2. It lets each worker read its share straight from its own copy of the model file, so the host uploads nothing. A 26.5 GB model loads onto six workers in about 62 s, and loading it again takes about 5 s because each worker still has the file in its cache.
-3. It makes that safe: a worker must show it has the same file as the host (size, header and sampled blocks), can only read inside its model folder, and cannot hang a load forever; in required mode a misconfigured worker fails the load with a named reason instead of silently falling back to the slow path.
+2. It lets each worker read its share from its own mount (or copy) of the model file, so the host uploads nothing. With the file on one read-only network share, a 26.5 GB model loads onto six workers in about 62 s, and a reload takes about 5 s from the workers' file cache.
+3. It makes that safe: the worker's file must match the host's (size, header, sampled blocks), reads stay inside its model folder, waits are bounded, and in required mode a misconfigured worker fails the load with a named reason instead of silently falling back to the slow path.
 
-With parallel upload, answers at temperature 0 were byte-identical to stock on all 16 tested models and splits, and generation speed was unchanged within noise.
+- With parallel upload, answers were byte-identical to stock on all 16 tested profiles; generation speed is unchanged.
+- Seven files change; the RPC protocol version (10.0.0) does not, so stock machines still interoperate.
+- Used by [Potluck](https://github.com/Jtonna/datacenter-gpu-orchestrator), which pools mixed machines into one GPU cluster; every machine in a load runs programs built from this fork.
+- Upstream base [`0a76757`](https://github.com/ggml-org/llama.cpp/commit/0a76757469ea94ad5f88d14e18cc7370b9931f99). Build from `potluck`, the default branch (called `ps5-direct-pull` until 23 November 2026 (UTC)); the other branches are earlier stages kept for reference.
 
-The changes touch seven files (model loader, RPC backend, server load logging) and the RPC protocol version is unchanged (10.0.0), so stock machines still interoperate.
-
-Upstream base: [`0a76757`](https://github.com/ggml-org/llama.cpp/commit/0a76757469ea94ad5f88d14e18cc7370b9931f99). Build from `ps5-direct-pull`, the default branch; the other branches are earlier stages kept for reference.
-
-This is the llama.cpp build used by Potluck, the scheduler in [Jtonna/datacenter-gpu-orchestrator](https://github.com/Jtonna/datacenter-gpu-orchestrator), which pools mixed machines into one GPU cluster; every machine in a load runs programs built from this fork.
-
-Details and all measurements: [FORK_CHANGES.md](FORK_CHANGES.md). Release builds: [docs/potluck-builds.md](docs/potluck-builds.md).
+What changed, why, and the measurements: [CHANGELOG_FOR_POTLUCK.md](CHANGELOG_FOR_POTLUCK.md). Release builds: [docs/potluck-builds.md](docs/potluck-builds.md).
 
 ---
 

@@ -81,8 +81,8 @@ starts.
 
 ## How to cut a release
 
-Releases are cut from the branch that carries the fork's patches. Tag the
-commit to release and push the tag:
+Releases are cut from the `potluck` branch, which carries the fork's patches.
+Tag the commit to release and push the tag:
 
 ```sh
 git tag -a potluck-llama-v0.1.0 -m "Potluck llama v0.1.0" <commit>
